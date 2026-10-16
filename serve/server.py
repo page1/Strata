@@ -2573,6 +2573,27 @@ def layer_split_of(cfg: dict) -> bool:
     return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
 
 
+HIBERNATE_LATCH = "strata-hibernated.txt"   # in --conversation-disk-dir; the disk tier's own files are strata-conv-*
+
+
+def hibernate_latch(args: list[str], cwd: str | None = None) -> Path | None:
+    """Hibernate (opt-in, needs #1937's --conversation-disk-dir with --conversation-disk-persist on or exit-only):
+    POST /unload {"save": true} ends the engine with QUIT, which writes its conversations to that folder, and this file
+    in the folder then holds the model unloaded - a request answers 503 instead of loading it back over whatever took
+    the GPU and the RAM - until POST /load, which starts it again (the conversations come back from the disk).  A
+    file, so it survives a server restart.  None without both flags."""
+    if "--conversation-disk-dir" not in args or "--conversation-disk-persist" not in args:
+        return None
+    i = args.index("--conversation-disk-persist") + 1
+    j = args.index("--conversation-disk-dir") + 1
+    if i >= len(args) or args[i] not in ("on", "exit-only") or j >= len(args):
+        return None
+    d = Path(args[j])
+    if not d.is_absolute() and cwd:
+        d = Path(cwd) / d
+    return d / HIBERNATE_LATCH
+
+
 def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
@@ -3089,6 +3110,7 @@ class Service:
         # server's model); the next request after an unload starts the engine again
         self.idle_unload_s = 0
         self.min_free_vram_mib = 0
+        self.hibernate_latch: Path | None = None        # hibernate (opt-in): see hibernate_latch()
         self.before_load = None
         self.before_load_timeout_s = 120.0               # #1997: how long the before_load command may run
         self.before_load_ignore_failure = False          # #1997: load even when it fails, without a VRAM check
@@ -3316,11 +3338,17 @@ class Service:
         except Exception:
             return None
 
-    def ensure_loaded(self):
+    def hibernated(self) -> bool:
+        """POST /unload {"save": true} wrote the latch: the model stays unloaded until POST /load."""
+        return self.hibernate_latch is not None and self.hibernate_latch.exists()
+
+    def ensure_loaded(self, resume: bool = False):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
-        the free-VRAM check.  The caller holds self.fifo."""
+        the free-VRAM check.  The caller holds self.fifo.  While hibernated only a resume (POST /load) starts it."""
         if self.loaded() and not self._vision_down():
             return
+        if self.hibernated() and not resume:
+            raise GpuBusy("the model is hibernated (its conversations are on the disk): POST /load resumes it")
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
@@ -3441,8 +3469,9 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self):
-        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
+    def load(self, resume: bool = False):
+        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy).
+        resume=True (POST /load): also while hibernated; the latch goes once the engine is up."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
@@ -3463,7 +3492,9 @@ class Service:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
                 try:
-                    self.ensure_loaded()
+                    self.ensure_loaded(resume=resume)
+                    if resume:
+                        self._end_hibernate()
                 finally:
                     if trace is not None:
                         with self.status_lock:
@@ -3474,42 +3505,73 @@ class Service:
                 with self.status_lock:
                     self.status["queued"] -= 1
 
+    def _end_hibernate(self) -> None:
+        """The engine is up again (its conversations come back from the disk as requests continue them): the latch
+        goes."""
+        if self.hibernated():
+            try:
+                self.hibernate_latch.unlink()
+                print("[strata] hibernate: resumed; the conversations come back from the disk as they are continued",
+                      flush=True)
+            except OSError as e:
+                print(f"[strata] hibernate: resumed, but the latch could not be removed ({e})", flush=True)
+
     UNLOAD_WAIT_S = 300.0       # #1997: POST /unload?wait=1 waits this long for the running turn (wait=<s> to choose)
 
-    def unload_waiting(self, wait_s: float) -> str:
+    def unload_waiting(self, wait_s: float, save: bool = False) -> str:
         """#1997: unload(), but a running or queued request is waited for (up to wait_s) instead of answering "busy":
         a peer server that needs this GPU can then free the card on the server's terms.  "busy" after wait_s."""
         deadline = time.monotonic() + max(0.0, wait_s)
         while True:
-            r = self.unload()
+            r = self.unload(save=save)
             if r != "busy" or time.monotonic() >= deadline:
                 return r
             time.sleep(0.25)
 
-    def unload(self, idle_for: float | None = None) -> str:
+    def unload(self, idle_for: float | None = None, save: bool = False) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
-        with idle_for: one ran more recently than that) or "unsupported"."""
+        with idle_for: one ran more recently than that) or "unsupported".  save=True hibernates: the engine's QUIT
+        writes its conversations to the disk tier, then the latch holds the model unloaded until POST /load
+        ("hibernate failed: ..." without #1937's disk tier in persist mode)."""
         if not hasattr(self.engine, "unload"):
             return "unsupported"
+        if save and self.hibernate_latch is None:
+            return ("hibernate failed: it needs --conversation-disk-dir with --conversation-disk-persist on (or "
+                    "exit-only) in the config's args")
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
             if not self.engine.alive():
+                if save:                                 # its last QUIT saved the conversations already
+                    self._write_latch()
                 return "not loaded"
             with self.status_lock:
                 if self.status.get("busy") or self.status.get("queued"):
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
-            self.engine.unload()
+            t0 = time.time()
+            self.engine.unload()                         # QUIT: with persist, the engine writes its conversations first
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
-            print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
-                  "the next request loads it again", flush=True)
+            if save:
+                self._write_latch()
+                print(f"[strata] hibernated in {time.time() - t0:.1f} s: the conversations are in "
+                      f"{self.hibernate_latch.parent}; requests answer 503 until POST /load", flush=True)
+            else:
+                print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
+                      "the next request loads it again", flush=True)
             return "unloaded"
         finally:
             self.fifo.release()
+
+    def _write_latch(self) -> None:
+        latch = self.hibernate_latch
+        latch.parent.mkdir(parents=True, exist_ok=True)
+        tmp = latch.with_name(latch.name + ".tmp")
+        tmp.write_text(f"hibernated {time.strftime('%Y-%m-%d %H:%M:%S')}\n", encoding="utf-8")
+        tmp.replace(latch)
 
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
@@ -5341,7 +5403,9 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(),
+                                 **({"hibernated": svc.hibernated()} if svc.hibernate_latch is not None else {}),
+                                 "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -5445,15 +5509,20 @@ def make_handler(svc: Service):
                 try:
                     wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
                                          svc.UNLOAD_WAIT_S)
-                    r = svc.unload_waiting(wait_s) if wait_s else svc.unload()
+                    save = self.control.get("save") is True     # hibernate (see hibernate_latch)
+                    r = svc.unload_waiting(wait_s, save=save) if wait_s else svc.unload(save=save)
                 except EngineStuck as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                self._json(409 if r == "busy" else 200, {"status": r})
+                if r.startswith("hibernate failed"):
+                    self._json(400, {"error": {"type": "invalid_request_error", "message": r}})
+                    return
+                self._json(409 if r == "busy" else 200,
+                           {"status": r, **({"hibernated": svc.hibernated()} if save else {})})
                 return
-            if path == "/load":                              # load now, e.g. ahead of a request
+            if path == "/load":                              # load now, e.g. ahead of a request; resumes a hibernate
                 try:
-                    svc.load()
+                    svc.load(resume=True)
                     self._json(200, {"status": "loaded"})
                 except GpuBusy as e:
                     ra = getattr(e, "retry_after", None)
@@ -5477,9 +5546,12 @@ def make_handler(svc: Service):
                     if path == "/v1/unload":
                         wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
                                              svc.UNLOAD_WAIT_S)
-                        result = svc.unload_waiting(wait_s) if wait_s else svc.unload()
+                        save = req.get("save") is True
+                        result = svc.unload_waiting(wait_s, save=save) if wait_s else svc.unload(save=save)
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
+                        if result.startswith("hibernate failed"):
+                            raise ValueError(result)
                     else:
                         if not svc.fifo.acquire(blocking=False):
                             raise ModelBusy("a request is running or queued")
@@ -5487,7 +5559,8 @@ def make_handler(svc: Service):
                             with svc.status_lock:
                                 if svc.status.get("busy") or svc.status.get("queued"):
                                     raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded()
+                            svc.ensure_loaded(resume=True)
+                            svc._end_hibernate()
                             svc.last_request_at = time.time()
                         finally:
                             svc.fifo.release()
@@ -5635,7 +5708,9 @@ def make_handler(svc: Service):
             self._json(200, props)
 
         def _control_body(self) -> bool:
-            """Consume the unused control body before replying/closing (Windows otherwise sends a TCP reset)."""
+            """Consume the control body before replying/closing (Windows otherwise sends a TCP reset); its JSON object,
+            if any, is kept as self.control."""
+            self.control = {}
             if self._chunked():
                 self.body_read = True
                 try:
@@ -5657,9 +5732,11 @@ def make_handler(svc: Service):
                 self._json(413, {"error": {"message": "control request body is limited to 64 KiB"}})
                 return False
             timeout = self.connection.gettimeout()
+            data = b""
             try:
                 self.connection.settimeout(2.0)
-                complete = len(self.rfile.read(length)) == length
+                data = self.rfile.read(length)
+                complete = len(data) == length
             except OSError:
                 complete = False
             finally:
@@ -5667,7 +5744,13 @@ def make_handler(svc: Service):
                 self.body_read = True                    # nothing left for the drain to wait for (#594)
             if not complete:
                 self._json(400, {"error": {"message": "incomplete control request body"}})
-            return complete
+                return False
+            try:                                         # {"save": true} for /unload (hibernate); anything else ignored
+                body = json.loads(data or b"{}")
+                self.control = body if isinstance(body, dict) else {}
+            except ValueError:
+                self.control = {}
+            return True
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -6707,6 +6790,11 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
+        latch = hibernate_latch(engine_args(cfg), cfg.get("cwd"))
+        if latch is not None and latch.exists() and not lazy:
+            print(f"[strata] hibernate: {latch} is there - the model stays unloaded until POST /load resumes it",
+                  flush=True)
+            lazy = True
         if cfg.get("vision"):
             elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
@@ -6772,6 +6860,11 @@ def main() -> int:
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
+    if a.engine == "strata" and cfg:                    # hibernate: on with #1937's disk tier in persist mode
+        svc.hibernate_latch = hibernate_latch(engine_args(cfg), cfg.get("cwd"))
+        if svc.hibernate_latch is not None:
+            print(f'[strata] hibernate: POST /unload {{"save": true}} saves the conversations to '
+                  f"{svc.hibernate_latch.parent} and holds the model unloaded until POST /load", flush=True)
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
