@@ -1112,6 +1112,26 @@ hits of the day came from the QUIT save. Tested there with three 13K-token conve
 nothing written while the engine ran, two conversations written at QUIT, and after the next start the follow-up took
 12,912 of its 12,938 tokens from the disk.
 
+**Hibernate: the model out of the way while another program runs (opt-in, with `--conversation-disk-dir` and
+`--conversation-disk-persist on|exit-only`).** For a coding agent that runs a RAM- or GPU-heavy program itself (a
+simulation, a training run, an ML pipeline) and then comes back to the same long conversation to read the results:
+
+- `POST /unload {"save": true}` (or `/v1/unload` with `"save": true`) ends the engine with QUIT, which writes the
+  current and the parked conversations to the disk folder as above, and then writes `strata-hibernated.txt` there;
+- while that file is there the model stays unloaded: every request answers 503 instead of loading it back over the
+  program that took the GPU and the RAM, `/health` says `"hibernated": true`, and a server started again stays
+  unloaded too;
+- `POST /load` starts the engine and removes the file; the conversations come back from the disk as requests continue
+  them;
+- without the disk tier in a persist mode, `{"save": true}` answers 400 and stops nothing. A plain `/unload` is
+  unchanged.
+
+Measured on an RTX 3090 24 GB, Core Ultra 9 285K, 95 GB DDR5-6800, WD SN8100, Windows 11, IQ3_S at 262K context,
+`--conversation-disk-persist on`, a 99,694-token conversation, two rounds: the save took 4.2-4.5 s and gave back
+~53 GB of RAM and ~22 GB of VRAM; after a server restart the model stayed unloaded; from `POST /load` to the first
+answer of the continued conversation took 18.1-18.7 s (all but 24 tokens from the disk), against 53.2-53.8 s for the
+same request on a fresh start without the disk tier (16.4-16.9 s to start, then the prompt read cold).
+
 **The RAM figure (`available_host_bytes()`).** The headroom is the smallest of three
 numbers, sampled each time it is asked and not a reservation (other writers can take the
 room afterwards):
