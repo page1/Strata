@@ -236,7 +236,7 @@ int main() {
     }
     check(tier_files(dir) == 0, "the tier removes its files when it ends");
 
-    {   // a read the RAM preflight refuses: nothing restored, the files are gone anyway
+    {   // a read the RAM preflight refuses (also the live state alone): nothing restored, the files are gone anyway
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e) && tier.put(split_image(400, 10)), "put for a refused read");
         tier.wait_idle();
@@ -246,6 +246,25 @@ int main() {
         check(!ok && back.kv.empty() && back.stage_images.empty() && tier.size() == 0 && tier_files(dir) == 0,
               "refused read: empty image, entry and files gone");
         check(tier.stats().read_failed == 1, "a failed read is counted");
+    }
+    {   // no RAM for the checkpoints, room for the live state: it comes back without them
+        ConversationDiskTier tier(opts(dir, GiB));
+        const SavedConversation original = image(400, 30);
+        check(tier.open(e) && tier.put(image(400, 30)), "put for a lean read");
+        tier.wait_idle();
+        const auto m = tier.best(prompt_of(450), {}, false);
+        std::vector<uint64_t> asked;
+        SavedConversation back;
+        const bool ok = tier.take(m.id, m.tokens, back, e, [&](uint64_t need, std::string& why) {
+            asked.push_back(need);
+            if (asked.size() == 1) { why = "no RAM for all of it"; return false; }
+            return need < asked[0];
+        });
+        check(ok && asked.size() == 2 && asked[1] < asked[0], "lean read: asked for less the second time");
+        check(ok && back.checkpoints.empty() && same_checkpoint(back.live, original.live) &&
+                  back.kv.size() == original.kv.size() && back.kv[0].k == original.kv[0].k,
+              "lean read: the live state and the K/V exact, no checkpoints");
+        check(tier.size() == 0 && tier_files(dir) == 0, "lean read: the files are spent");
     }
 
     {   // put_streamed: the K/V read from where it lives (here: the image's own buffers) gives the same files

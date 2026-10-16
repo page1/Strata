@@ -793,8 +793,16 @@ bool get_payload(In& in, SavedConversation& s) {
     uint64_t n = 0;
     // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
     if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
-    s.checkpoints.resize((size_t) n);
-    for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
+    if (in.limits.drop_checkpoints) {
+        s.checkpoints.clear();
+        for (uint64_t i = 0; i < n; ++i) {   // read (and hashed) one at a time, then dropped
+            ConversationCheckpoint dropped;
+            if (!get_checkpoint(in, dropped)) return false;
+        }
+    } else {
+        s.checkpoints.resize((size_t) n);
+        for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
+    }
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
     if (in.targets && n != in.targets->size()) return in.fail("K/V layer count differs from this session's");
     s.kv.resize((size_t) n);
@@ -1242,7 +1250,10 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
         if (targets)
             for (const auto& t : *targets)
                 for (size_t part : t.sizes) streamed += part;
-        if (!limits.admit(session_read_peak_bytes(size - std::min(streamed, size)), why)) {
+        uint64_t held = size - std::min(streamed, size);   // what the parse keeps in RAM
+        if (limits.drop_checkpoints)                         // the live state and one checkpoint at a time
+            held = held / ((uint64_t) limits.checkpoint_count + 1) * std::min<uint64_t>(2, limits.checkpoint_count + 1);
+        if (!limits.admit(session_read_peak_bytes(held), why)) {
             st.error = SessionError::memory;
             error = "session file: " + why;
             return false;
