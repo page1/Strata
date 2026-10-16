@@ -11111,7 +11111,7 @@ int main(int argc, char** argv) {
                     auto admit = [&](uint64_t need, std::string& why) -> bool {
                         std::optional<strata::core::HostMemoryReading> mem;
                         if (make_ram(need, floor, evicted, mem)) return true;
-                        why = "not enough RAM: " + ram_note(mem);
+                        why = "not enough RAM for " + std::to_string(need >> 20) + " MiB: " + ram_note(mem);
                         return false;
                     };
                     strata::core::SavedConversation image;
@@ -11236,7 +11236,7 @@ int main(int argc, char** argv) {
                 auto admit = [&](uint64_t need, std::string& why) -> bool {
                     std::optional<strata::core::HostMemoryReading> mem;
                     if (make_ram(need, floor, evicted, mem)) return true;
-                    why = "not enough RAM even for the running state: " + ram_note(mem);
+                    why = "not enough RAM even for the running state (" + std::to_string(need >> 20) + " MiB): " + ram_note(mem);
                     return false;
                 };
                 ok = ok && conv_disk.take(stream.id, stream.tokens, meta, serr, admit, &kv);
