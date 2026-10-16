@@ -105,9 +105,11 @@ public:
     /// With `kv` (per image, its K/V targets: conversation_snapshot_targets) the files' K/V is streamed into them
     /// instead of RAM, and `out` gets the rest; a queued entry is refused (its image is in RAM: take it without).
     /// On failure after a read began, the targets may hold part of it.
+    /// `live`: the request matched the entry's live state (Match::live).  Only then is a read the RAM refuses whole
+    /// tried again without the checkpoints; a checkpoint match needs its checkpoint, so it stays refused.
     bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
               const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {},
-              const std::vector<std::vector<SessionKvTarget>>* kv = nullptr);
+              const std::vector<std::vector<SessionKvTarget>>* kv = nullptr, bool live = false);
 
     /// Whether images wait in the queue or are being written (their RAM is not back yet).
     bool pending() const;

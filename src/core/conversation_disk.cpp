@@ -473,7 +473,7 @@ bool ConversationDiskTier::store(Entry e, size_t images, const WriteFile& write_
 
 bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
                                 const std::function<bool(uint64_t, std::string&)>& admit,
-                                const std::vector<std::vector<SessionKvTarget>>* kv) {
+                                const std::vector<std::vector<SessionKvTarget>>* kv, bool live) {
     out = SavedConversation{};
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(m_);
@@ -528,7 +528,7 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
         ok = kv ? session_file_read(files[k], fid, part, (*kv)[k], n, error, limits, &st)
                 : session_file_read(files[k], fid, part, n, error, limits, &st);
         const bool no_ram = !ok && k == 0 && st.error == SessionError::memory;   // refused before anything was read
-        if (no_ram && !want.checkpoints.empty() && !limits.drop_checkpoints) {
+        if (no_ram && live && !want.checkpoints.empty() && !limits.drop_checkpoints) {
             // no room for its checkpoints: the live state alone (the conversation continues; only a later request
             // that goes back before its end has no checkpoint to start from)
             SessionReadLimits lean = limits;

@@ -11117,7 +11117,7 @@ int main(int argc, char** argv) {
                     strata::core::SavedConversation image;
                     std::string disk_err;
                     const auto d0 = Clock::now();
-                    if (conv_disk.take(on_disk.id, on_disk.tokens, image, disk_err, admit)) {
+                    if (conv_disk.take(on_disk.id, on_disk.tokens, image, disk_err, admit, nullptr, on_disk.live)) {
                         disk_read_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
                         incoming.emplace(std::move(image));
                         parked.tokens = on_disk.tokens;
@@ -11239,7 +11239,7 @@ int main(int argc, char** argv) {
                     why = "not enough RAM even for the running state (" + std::to_string(need >> 20) + " MiB): " + ram_note(mem);
                     return false;
                 };
-                ok = ok && conv_disk.take(stream.id, stream.tokens, meta, serr, admit, &kv);
+                ok = ok && conv_disk.take(stream.id, stream.tokens, meta, serr, admit, &kv, stream.live);
                 ok = ok && strata::core::conversation_snapshot_restore_streamed(meta, ss, g, draft0, serr) ==
                            strata::core::ConversationRestore::restored;
                 for (size_t k = 0; ok && k < stages.size(); ++k) {
