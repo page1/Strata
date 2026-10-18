@@ -175,6 +175,13 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 
+// local: the states with the model off the GPU or out of RAM - [pill text, Monitor label, detail]
+const STANDBY = {
+  suspended: ["Suspended · RAM free", "Suspended: RAM given back", "the GPU keeps the model; the next request resumes it in seconds"],
+  hibernated: ["Hibernated · RAM and VRAM free", "Hibernated", "conversations saved; the next request resumes it"],
+  unloaded: ["Unloaded", "Unloaded", "the next request loads it"],
+};
+
 function setPill(state, text) {
   $("pill").dataset.state = state === "error" ? "queued" : state;
   $("pill-text").textContent = text;
@@ -189,6 +196,13 @@ function render(m) {
     setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
   } else if (live.state === "generating") {
     setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+  } else if (live.state === "loading" || live.state === "resuming") {
+    setPill("reading", live.state === "resuming" ? "Resuming…" : "Loading model…");
+  } else if (STANDBY[live.state] && live.held_by && live.held_by.length) {
+    // local: a running job holds it - nothing loads the model back until the job ends
+    setPill("queued", `Locked · ${live.state} (job ${live.held_by.join(", ")})`);
+  } else if (STANDBY[live.state]) {
+    setPill("idle", STANDBY[live.state][0]);
   } else {
     setPill("idle", "Idle");
   }
@@ -240,9 +254,43 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
+// local: who holds the model (a wrapped job): its command, folder and agent session, and what to do about it
+function holdersText(hs) {
+  return (hs || []).map((x) => {
+    if (!x.wrapped) return `pid ${x.pids.join(", ")}: ${x.command || "?"} (not a wrapped job)`;
+    const who = x.session ? ` · ${x.agent} session "${x.title || x.session}"` : "";
+    const loop = x.loop ? ` · started ${x.starts} times in 30 min: stop that session first (Esc), or it starts the job again` : "";
+    return `${x.command} in ${x.folder} · ${Math.round((x.running_s || 0) / 60)} min${who}${loop}`;
+  }).join("  |  ");
+}
+
+// local: the requests in Strata now - state, how long, who sent them (an opencode session, a subagent and its task)
+function requestLine(r) {
+  const mins = Math.floor((r.waiting_s || 0) / 60);
+  const t = mins ? `${r.state} (${mins} min)` : r.state;
+  if (!r.session) return `${t} - from ${r.client || "a client"}`;
+  if (r.parent) {
+    return `${t} - subagent${r.subagent ? " " + r.subagent : ""} of "${r.parent_title || r.parent}"` +
+      (r.task ? ` - task: ${r.task}` : "");
+  }
+  return `${t} - opencode session "${r.title || r.session}"`;
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+  // local: the requests row (shown while any request is in Strata)
+  const reqs = live.requests || [];
+  $("state-requests").hidden = !reqs.length;
+  if (reqs.length) $("state-requests-text").textContent = `Requests (${reqs.length}):\n` + reqs.map(requestLine).join("\n");
+  // local: the holders row (shown only while a job holds the model)
+  const held = STANDBY[live.state] && live.holders && live.holders.length;
+  $("state-holders").hidden = !held;
+  if (held) {
+    $("state-holders-text").textContent = holdersText(live.holders);
+    $("state-stop").hidden = !live.holders.some((x) => x.wrapped);
+  }
   // model state
-  const on = live.queued > 0 ? "queued" : live.state;
+  const on = live.queued > 0 ? "queued" : live.state === "resuming" ? "loading" : live.state;
+  const busy = live.state === "reading" || live.state === "generating";
   for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
   const prog = $("state-progress");
   let label = "Waiting for a request", detail = "", pct = 0;
@@ -260,6 +308,19 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
     detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+  } else if (live.state === "loading" || live.state === "resuming") {
+    label = live.state === "resuming" ? "Resuming" : "Loading the model";
+    prog.dataset.tone = "info";
+    detail = "a request is waiting for it";
+  } else if (STANDBY[live.state] && live.held_by && live.held_by.length) {
+    prog.dataset.tone = "info";
+    label = `Locked · ${live.state}`;   // the same order as the pill: "Locked · unloaded"
+    detail = `locked by a running job (pid ${live.held_by.join(", ")}): requests wait until it ends, ` +
+      "then the model resumes by itself";
+  } else if (STANDBY[live.state]) {
+    delete prog.dataset.tone;
+    label = STANDBY[live.state][1];
+    detail = STANDBY[live.state][2];
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
@@ -272,7 +333,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
             live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+  const prefill = busy ? live.prefill_tok_s_mean
                 : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
   setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
             live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
@@ -312,7 +373,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // context fill: the running request, else the last one
   const ctx = eng.max_context || 0;
   let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
+  if (busy) used = (live.prompt_tokens || 0) + (live.generated || 0);
   else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
   const frac = ctx ? Math.min(1, used / ctx) : 0;
   $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
@@ -401,6 +462,25 @@ document.addEventListener("click", (e) => {
   if (b) copyText(b.dataset.copy, b);
 });
 $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
+// local: end the wrapped job(s) holding the model (POST /hold {"stop": "all"}); the agent that ran a job is told not
+// to run it again, and is never woken for it
+$("state-stop").addEventListener("click", async () => {
+  const text = $("state-holders-text").textContent;
+  if (!confirm(`End the job(s) holding the model?\n\n${text}`)) return;
+  const btn = $("state-stop");
+  btn.disabled = true;
+  try {
+    const r = await fetch("hold", {method: "POST", headers: headers(true), body: JSON.stringify({stop: "all"})});
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) alert(`Stop failed: ${(b.error && b.error.message) || r.status}`);
+    else {
+      const loops = (b.stopped || []).filter((x) => x.stopped && x.loop);
+      if (loops.length) alert(`Stopped. ${loops.map((x) => x.advice).join("\n")}`);
+    }
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
@@ -909,8 +989,40 @@ function isTextFile(f) {
   return f.type.startsWith("text/") || /json|xml|javascript|yaml|toml|x-sh|x-python/.test(f.type) ||
          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
 }
+// PDF / Word / Excel / PowerPoint: the server turns them into text (POST /convert, MarkItDown), attached like a text file
+const DOC_EXT = /\.(pdf|docx|xlsx|pptx)$/i;
+const MAX_DOC_FILE = 50 * 1024 * 1024;
+const MAX_DOC_TEXT = 1024 * 1024;
+async function addDocument(f) {
+  if (f.size > MAX_DOC_FILE) { toast("warn", "File too large", `${f.name} is over 50 MB.`); return; }
+  toast("info", "Reading document", f.name);
+  try {
+    const data = await new Promise((ok, fail) => {
+      const r = new FileReader();
+      r.onload = () => ok(r.result);
+      r.onerror = () => fail(r.error || new Error("could not read the file"));
+      r.readAsDataURL(f);
+    });
+    const r = await fetch("convert", {method: "POST", headers: headers(true), body: JSON.stringify({name: f.name, data})});
+    let j = {};
+    try { j = await r.json(); } catch (e) { /* not json */ }
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    const text = String(j.text || "");
+    if (text.trim().length < 20) {
+      toast("warn", "No text found", `${f.name}: nothing could be read - a scan or a picture has no text layer.`, 8000);
+      return;
+    }
+    if (text.length > MAX_DOC_TEXT) { toast("warn", "Document too long", `${f.name} is over 1 MB of text.`, 8000); return; }
+    attachments.push({kind: "file", name: f.name, text});
+    renderAttachments();
+    toast("success", "Document attached", `${f.name}: ${text.length.toLocaleString()} characters of text.`);
+  } catch (e) {
+    toast("error", "Could not read document", `${f.name}: ${e.message}`, 8000);
+  }
+}
 function addFiles(files) {
   for (const f of files) {
+    if (DOC_EXT.test(f.name)) { addDocument(f); continue; }
     if (f.type.startsWith("image/")) {
       if (!health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
       if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
@@ -919,7 +1031,7 @@ function addFiles(files) {
       r.readAsDataURL(f);
       continue;
     }
-    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${health.images ? " or pictures" : ""}.`); continue; }
+    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data), PDF, Word, Excel or PowerPoint${health.images ? " or pictures" : ""}.`); continue; }
     if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
     const r = new FileReader();
     r.onload = () => {

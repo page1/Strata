@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -145,6 +146,14 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
     return true;
 }
 
+// The disk tier's chain a conversation continues (conversation_disk.hpp, --conversation-disk-delta): the entry it was
+// read back from, and how many of its tokens are unchanged since then (each request lowers it to where it reads from).
+// A run-time note only, never in a file.  0: none.
+struct ConversationDiskParent {
+    uint64_t chain = 0;
+    int64_t unchanged = 0;
+};
+
 struct SavedConversation {
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
@@ -156,6 +165,10 @@ struct SavedConversation {
     bool cvec = true;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
+    /// --conv-experts: the adaptive tier's routing counts (layers x experts) when this conversation was parked, so
+    /// the GPU's expert cache can follow it back; empty when the option is off (not in session files)
+    std::vector<float> expert_usage;
+    ConversationDiskParent disk_parent;   // the first image's only
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -169,7 +182,7 @@ struct SavedConversation {
         for (const auto& s : stage_images) n += s.bytes();
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();
-        return n;
+        return n + expert_usage.capacity() * sizeof(float);
     }
 };
 
@@ -284,10 +297,15 @@ public:
         auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
         if (victim == entries_.end()) return false;
         bytes_ -= victim->bytes();
+        SavedConversation gone = std::move(*victim);
         entries_.erase(victim);
         ++evictions_;
+        if (on_evict_) on_evict_(std::move(gone));   // e.g. the disk tier (conversation_disk.hpp); else dropped here
         return true;
     }
+
+    /// Where an evicted conversation goes instead of being dropped (the disk tier); it owns the image from then on.
+    void set_on_evict(std::function<void(SavedConversation&&)> fn) { on_evict_ = std::move(fn); }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
     // may carry the poison.  Returns how many were parked.
@@ -350,6 +368,7 @@ private:
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
     std::deque<SavedConversation> entries_; // least recently active first
+    std::function<void(SavedConversation&&)> on_evict_;
     ConversationKvReuse reuse_;
 };
 

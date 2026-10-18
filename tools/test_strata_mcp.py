@@ -234,6 +234,7 @@ class Protocol(FakeRoot):
         self.assertEqual(init["serverInfo"]["name"], "strata")
         names = [t["name"] for t in r[2]["result"]["tools"]]
         self.assertEqual(names, ["strata_status", "strata_models", "strata_install", "strata_start", "strata_stop",
+                                 "strata_suspend", "strata_resume",
                                  "strata_logs", "strata_benchmark", "strata_connect_info"])
         for t in r[2]["result"]["tools"]:
             self.assertEqual(t["inputSchema"]["type"], "object")
@@ -272,7 +273,7 @@ class Protocol(FakeRoot):
                            timeout=60, env=dict(os.environ))
         lines = [json.loads(x) for x in p.stdout.splitlines()]
         self.assertEqual(sorted(m["id"] for m in lines), [1, 2, 3])
-        self.assertEqual(len(next(m for m in lines if m["id"] == 2)["result"]["tools"]), 8)
+        self.assertEqual(len(next(m for m in lines if m["id"] == 2)["result"]["tools"]), 10)
         self.assertIn("ready", p.stderr)
 
     def test_not_a_strata_folder(self):

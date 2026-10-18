@@ -7,7 +7,7 @@ Add it to Claude Code, Claude Desktop, Cursor, VS Code, Codex ... (docs/MCP_SERV
 ask your AI "install Strata for this PC", "start Strata", "is Strata running?".  It speaks MCP (JSON-RPC 2.0, one
 message per line) over stdin/stdout, uses the Python standard library only (it runs before setup made .venv; Python
 3.10 or newer), and offers a fixed set of tools: strata_status, strata_models, strata_install, strata_start,
-strata_stop, strata_logs, strata_benchmark, strata_connect_info.
+strata_stop, strata_suspend, strata_resume, strata_logs, strata_benchmark, strata_connect_info.
 
 Safety: no tool takes a shell command or a free path.  Every argument is checked against setup.py's own choices
 (models, families, contexts ...); the only path argument (install's data_dir) must be the Strata data folder, a folder
@@ -296,6 +296,19 @@ def dir_size_gb(path: Path, limit_files: int = 20000) -> float:
 
 # ------------------------------------------------------------------------------------------------ HTTP
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # localhost: never through a proxy
+SUSPEND_TIMEOUT_S = 3600.0   # strata_suspend: saving the parked conversations runs at roughly 10 s per GiB
+
+
+def _hibernated(port: int, api_key=None, polls: int = 30) -> bool:
+    """After a suspend request this side gave up on: did the server finish hibernating anyway?"""
+    for _ in range(polls):
+        st, health = http_json(f"http://127.0.0.1:{port}/health", api_key=api_key, timeout=10)
+        if st == 200 and isinstance(health, dict) and health.get("hibernated"):
+            return True
+        if st == 200 and isinstance(health, dict) and not health.get("loaded", True):
+            return False                                   # ended without the latch: nothing was saved
+        time.sleep(2.0)
+    return False
 
 
 def http_json(url: str, method="GET", body=None, api_key=None, timeout=3.0):
@@ -783,6 +796,8 @@ class Strata:
         info = {"port": port, "url": base, "model": health.get("model"), "context": health.get("max_context"),
                 "images": health.get("images"), "loaded": health.get("loaded"),
                 "api_key_required": bool(health.get("api_key"))}
+        if health.get("hibernated"):
+            info["hibernated"] = True
         if not deep:
             return info
         key = self.api_key_for(port)
@@ -1037,7 +1052,36 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "force": {"type": "boolean", "description": "stop even while a request is running"}}},
          "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True,
                          "openWorldHint": False}},
-        {"name": "strata_logs", "title": "Strata logs",
+         {"name": "strata_suspend", "title": "Suspend Strata (hibernate)",
+          "description": "Give the GPU and RAM to another program (a simulation, a game) without losing the model's "
+                         "conversations: waits until Strata is idle, saves every parked conversation to the run "
+                         "config's \"hibernate_dir\", and ends the engine process - its VRAM and RAM come straight "
+                         "back. While suspended, requests answer 503 instead of loading the model back over the "
+                         "other program. Resume with strata_resume; the conversations come back, so long sessions do "
+                         "not replay. Needs \"hibernate_dir\" in strata-<model>.json and a recent engine.",
+          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
+              "port": port,
+              "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 600,
+                               "description": "retry while a request is running or queued, up to this long "
+                                              "(default 60; 0: refuse while busy)"},
+              "keep_gpu": {"type": "boolean",
+                           "description": "give only the RAM back (~47 GB on the IQ3_S model): the GPU keeps the "
+                                          "model and the current conversation, and the resume takes seconds "
+                                          "instead of a full start. Default false: RAM and VRAM"}}},
+          "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True,
+                          "openWorldHint": False}},
+         {"name": "strata_resume", "title": "Resume Strata",
+          "description": "Load the model again after strata_suspend: the engine re-parks the saved conversations "
+                         "before it is ready, so sessions continue where they were. fresh=true discards the saved "
+                         "conversations and starts clean. Safe to call when nothing is suspended.",
+          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
+              "port": port,
+              "fresh": {"type": "boolean", "description": "discard the saved conversations and start clean"},
+              "wait_seconds": {"type": "integer", "minimum": 0, "maximum": 600,
+                               "description": "how long to wait for the model to load (default 120)"}}},
+          "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True,
+                          "openWorldHint": False}},
+         {"name": "strata_logs", "title": "Strata logs",
          "description": "The last lines of a Strata log: 'server' (the model server this tool started: loading, "
                         "requests, errors), 'engine' (the engine's own log for a model), 'setup' (the install). "
                         "Default: the setup log while an install runs, else the server log. Read-only.",
@@ -1468,6 +1512,63 @@ class Tools:
                                        "Close its window to end it completely.",
                             "port": p, "engine_unloaded": r}
             return {"summary": "Strata is not running"}
+
+    # ---- strata_suspend / strata_resume
+    def _suspend_port(self, port):
+        s = self.s
+        tracked = s.tracked_server()
+        if tracked and not tracked.get("ended"):
+            return tracked["port"], s.api_key_for(tracked["port"])
+        for p in s.ports(port):
+            info = s.probe(p, deep=False)
+            if info and not info.get("other"):
+                return p, s.api_key_for(p)
+        raise ToolError("no Strata server answers; nothing to suspend")
+
+    def strata_suspend(self, port=None, wait_seconds=60, keep_gpu=False) -> dict:
+        s = self.s
+        p, key = self._suspend_port(port)
+        deadline = time.time() + wait_seconds
+        while True:
+            # saving tens of GB takes minutes; the server ends the wait itself if the engine stops answering
+            st, body = http_json(f"http://127.0.0.1:{p}/unload", "POST",
+                                 body={"save": True, **({"keep_gpu": True} if keep_gpu else {})}, api_key=key,
+                                 timeout=SUSPEND_TIMEOUT_S)
+            if st == 0 and _hibernated(p, key):          # the save finished after this side stopped waiting
+                st, body = 200, {"status": "unloaded", "hibernated": True}
+            status = (body or {}).get("status") if isinstance(body, dict) else None
+            if st == 200 and status == "unloaded":
+                lost = (body or {}).get("live_saved") is False
+                return {"summary": ("Strata is suspended (RAM only): the experts' RAM is free, the GPU keeps the "
+                                    "model and the current conversation, and the parked conversations are saved"
+                                    if keep_gpu else
+                                    "Strata is suspended: the engine ended, its VRAM and RAM are free, and the "
+                                    "conversations are saved") +
+                                   (" - except the current one (there was not enough free RAM to park it; it is "
+                                    "read again after resuming)" if lost else "") +
+                                   ". Requests answer 503 until strata_resume.",
+                        "port": p, "saved": (body or {}).get("hibernated") is True, "current_saved": not lost}
+            if st == 409 and status == "busy" and time.time() < deadline:
+                time.sleep(2.0)
+                continue
+            if st == 409:
+                raise ToolError("Strata is busy (a request is running or queued); wait for it or raise wait_seconds")
+            if st == 503 and "hibernate_dir" in str((body or {}).get("error", {}).get("message", "")):
+                raise ToolError("the run config has no \"hibernate_dir\" key: add one (a folder to save the "
+                                "conversations to) and restart the server")
+            raise ToolError(f"suspending failed (HTTP {st}): "
+                            f"{(body or {}).get('error', {}).get('message', status or 'no answer')}")
+
+    def strata_resume(self, port=None, fresh=False, wait_seconds=120) -> dict:
+        s = self.s
+        p, key = self._suspend_port(port)
+        st, body = http_json(f"http://127.0.0.1:{p}/load", "POST",
+                             body={"fresh": True} if fresh else {}, api_key=key, timeout=wait_seconds + 30)
+        if st == 200:
+            st2, health = http_json(f"http://127.0.0.1:{p}/health", timeout=10)
+            return {"summary": "Strata is loaded again" + ("" if fresh else " with its conversations re-parked"),
+                    "port": p, "loaded": (health or {}).get("loaded"), "hibernated": (health or {}).get("hibernated")}
+        raise ToolError(f"resuming failed (HTTP {st}): {(body or {}).get('error', {}).get('message', 'no answer')}")
 
     # ---- strata_logs
     def strata_logs(self, source=None, model=None, lines=80) -> dict:

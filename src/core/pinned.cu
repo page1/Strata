@@ -4,7 +4,10 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <vector>
 #include <climits>
 #include <cerrno>
 #include <cstdlib>
@@ -397,6 +400,32 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, un
     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
 }
 
+namespace {
+#ifdef _WIN32
+/// The first touch of every 4 KB page of [base, base + bytes) from STRATA_ARENA_PREFAULT (default min(16, cores))
+/// threads; the seconds it took, or -1 when it is off (STRATA_ARENA_PREFAULT=0).  `threads` gets the count.
+double touch_pages(void* base, uint64_t bytes, int& threads) {
+    const char* pf = std::getenv("STRATA_ARENA_PREFAULT");
+    const int n = pf != nullptr && *pf ? std::clamp(std::atoi(pf), 0, 64)
+                                       : (int) std::clamp(std::thread::hardware_concurrency(), 1u, 16u);
+    threads = n;
+    if (n <= 0) return -1.0;
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t per = (bytes / (uint64_t) n + 4095) / 4096 * 4096;
+    std::vector<std::thread> pool;
+    volatile uint8_t* const first = (volatile uint8_t*) base;
+    for (int t = 0; t < n; ++t)
+        pool.emplace_back([first, bytes, per, t] {
+            volatile uint8_t* p = first;
+            const uint64_t end = std::min<uint64_t>(bytes, (uint64_t) (t + 1) * per);
+            for (uint64_t off = (uint64_t) t * per; off < end; off += 4096) p[off] = 0;
+        });
+    for (auto& th : pool) th.join();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+#endif
+}  // namespace
+
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
                          uint64_t shared_pack_hash) : capacity(bytes) {
@@ -406,9 +435,28 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         mapping_base = base;
         mapping_bytes = bytes;
     }
+#ifdef _WIN32
+    // Windows, 4 KB pages: touch every page from several threads before the registration.  Left to cudaHostRegister,
+    // the first touch (the zero-fill) of the whole arena ran on one thread inside it: 4.98 s for 46.8 GiB on an RTX
+    // 3090 + Core Ultra 9 285K.  Touched by 16 threads first it took 0.47 s, and the registration then 0.08 s, the
+    // whole arena still registered (PORTABLE ok) and decode/prompt speed unchanged (3 + 3 starts).  Not for large
+    // pages or memory cudaHostAlloc pinned (resident already), or a shared arena file (touching would read it).
+    // STRATA_ARENA_PREFAULT=N sets the threads, 0 leaves the first touch to cudaHostRegister as before.
+    if (base != nullptr && backing == PageBacking::NormalPages && shared_file.empty()) {
+        int n = 0;
+        const double s = touch_pages(base, bytes, n);
+        if (s >= 0) {
+            char buf[160];
+            std::snprintf(buf, sizeof buf, "; pages first touched by %d threads in %.2f s (STRATA_ARENA_PREFAULT=0: by "
+                          "cudaHostRegister)", n, s);
+            note += buf;
+        }
+    }
+#endif
 
-    // Register with CUDA BEFORE any page is touched: cudaHostRegister pins what is resident now, and a region
-    // that has already been faulted in page by page is far more expensive to register and may fail outright.
+    // Register with CUDA before the experts are read into it.  (The old note here - a region faulted in page by page
+    // is far more expensive to register and may fail - did not hold on Windows for pages touched by the threads
+    // above: see their note.)
     if (base) {
         // #243: STRATA_ARENA_PIN_GIB=N caps the registration from the start where the caller set no cap
         const int env_gib = arena_pin_cap_gib();
@@ -628,6 +676,70 @@ void PinnedArena::register_slices(std::atomic<int>& ready) {
     ready.store(INT_MAX, std::memory_order_release);   // every slice done (or given up on)
 }
 
+bool PinnedArena::release_pages(std::string& err) {
+#ifdef _WIN32
+    if (base == nullptr || released) {
+        err = base == nullptr ? "no arena" : "the arena's RAM is already given back";
+        return false;
+    }
+    if (backing != PageBacking::NormalPages || mapping_base != base || slice_bytes != 0 || registered_bytes != capacity ||
+        locked_bytes != 0) {
+        err = "only an arena of 4 KB pages registered whole with CUDA can give its RAM back (this one: " + note + ")";
+        return false;
+    }
+    if (const cudaError_t e = cudaHostUnregister(base); e != cudaSuccess) {
+        (void) cudaGetLastError();
+        err = std::string("cudaHostUnregister failed: ") + cudaGetErrorString(e);
+        return false;
+    }
+    if (!VirtualFree(base, (SIZE_T) mapping_bytes, MEM_DECOMMIT)) {
+        const unsigned long code = GetLastError();
+        // put it back as it was: still committed, so register it again
+        const bool again = cudaHostRegister(base, (size_t) capacity, cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+        if (!again) {
+            (void) cudaGetLastError();
+            registered_bytes = 0;
+        }
+        err = "VirtualFree(MEM_DECOMMIT) failed (error " + std::to_string(code) + ")" +
+              (again ? std::string{} : std::string("; the arena is no longer pinned"));
+        return false;
+    }
+    registered_bytes = 0;
+    released = true;
+    return true;
+#else
+    err = "giving the arena's RAM back is implemented on Windows only";
+    return false;
+#endif
+}
+
+bool PinnedArena::reacquire_pages(std::string& err) {
+#ifdef _WIN32
+    if (!released) {
+        err = "the arena's RAM was not given back";
+        return false;
+    }
+    if (VirtualAlloc(base, (SIZE_T) mapping_bytes, MEM_COMMIT, PAGE_READWRITE) != base) {
+        err = "VirtualAlloc(MEM_COMMIT) at the arena's address failed (error " + std::to_string((unsigned long) GetLastError()) + ")";
+        return false;
+    }
+    released = false;   // committed again: the destructor releases it as usual from here
+    int n = 0;
+    (void) touch_pages(base, capacity, n);
+    if (const cudaError_t e = cudaHostRegister(base, (size_t) capacity, cudaHostRegisterPortable | cudaHostRegisterMapped);
+        e != cudaSuccess) {
+        (void) cudaGetLastError();
+        err = std::string("cudaHostRegister failed: ") + cudaGetErrorString(e);
+        return false;
+    }
+    registered_bytes = capacity;
+    return true;
+#else
+    err = "giving the arena's RAM back is implemented on Windows only";
+    return false;
+#endif
+}
+
 PinnedArena::~PinnedArena() {
     if (base && by_need) {
         for (const auto& r : locked_ranges) strata::platform::unlock_resident((uint8_t*) base + r.first, r.second);
@@ -642,7 +754,7 @@ PinnedArena::~PinnedArena() {
         if (locked_bytes) strata::platform::unlock_resident((uint8_t*) base + (slice_bytes ? registered_bytes : 0), locked_bytes);
         if (slice_bytes) {
             for (uint64_t off : slice_starts) cudaHostUnregister((uint8_t*) base + off);
-        } else {
+        } else if (registered_bytes > 0) {   // a released arena (partial hibernate) is no longer registered
             cudaHostUnregister(base);
         }
         release(mapping_base ? mapping_base : base, mapping_bytes ? mapping_bytes : capacity);

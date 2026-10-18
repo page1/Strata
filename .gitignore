@@ -9,6 +9,7 @@ bench/micro/*.bin
 bench/micro/*.dll
 bench/micro/*.txt
 *.log
+data/suspend-jobs/
 build*/
 pack/
 logs/

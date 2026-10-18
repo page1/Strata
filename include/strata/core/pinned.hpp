@@ -83,6 +83,14 @@ struct PinnedArena {
 
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }
+
+    /// Partial hibernate (Windows; a whole-registered arena of 4 KB pages, not a shared file): give the RAM back -
+    /// cudaHostUnregister, then decommit the pages, the address range staying reserved - and take it again at the
+    /// same address (commit, the pages touched by threads, cudaHostRegister); the contents are gone and must be read
+    /// again.  False with `err` (the arena as it was) when this arena cannot.
+    bool release_pages(std::string& err);
+    bool reacquire_pages(std::string& err);
+    bool released = false;
 };
 
 struct LoadStats {

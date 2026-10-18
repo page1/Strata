@@ -935,6 +935,14 @@ public:
     void set_gguf(const std::string& native) { gguf_ = native; }
     void close();
 
+    /// Partial hibernate: give the arena's RAM back (PinnedArena::release_pages: the experts are gone, the addresses
+    /// kept) and take it again - committed, pinned, the device aliases looked up again and the experts read again
+    /// as `open` read them.  Nothing may read a blob in between.  False with `err` when this arena cannot (an
+    /// arena that could not be taken again is unusable: the engine must end).
+    bool release_memory(std::string& err);
+    bool reacquire_memory(std::string& err);
+    bool released() const { return released_; }
+
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
@@ -1010,6 +1018,10 @@ private:
     /// index of the registered range holding [off, off + len), or -1
     int64_t pin_range_of(uint64_t off, uint64_t len) const;
     std::string gguf_;
+    std::string path_;               ///< experts.bin, when the experts were read from it (partial hibernate's re-read)
+    bool from_gguf_ = false;
+    int load_threads_ = 0;
+    bool released_ = false;
 };
 
 /// Plan v0.3 P6: checks native_experts.txt's GGUF spans against the files, before anything is read: each layer's

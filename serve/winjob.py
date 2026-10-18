@@ -95,3 +95,17 @@ def contain(proc) -> bool:
         return bool(_k32.AssignProcessToJobObject(_job, int(proc._handle)))
     except (AttributeError, OSError, ValueError):
         return False
+
+
+def release() -> bool:
+    """Local ("save_on_close"): clear the job's kill-on-close, so the children outlive this process.  Used only when
+    the console window is being closed: the engine, its stdin closed, then writes its conversations and ends on its
+    own (the MCP servers end when their pipes close).  True if the job's limit was cleared."""
+    if os.name != "nt":
+        return False
+    with _lock:
+        if not _job:
+            return False
+        info = _ExtendedLimits()                     # LimitFlags 0: no kill when the last handle closes
+        return bool(_k32.SetInformationJobObject(_job, _JobObjectExtendedLimitInformation, ctypes.byref(info),
+                                                 ctypes.sizeof(info)))

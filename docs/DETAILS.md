@@ -589,6 +589,70 @@ the OS file cache, so loading again takes seconds while that RAM is not needed e
 16 GB with Q2_0 in the low-RAM mode: unloading takes ~0.3 s, and a request to an unloaded model answered after
 4.6 s (text) or 14.7 s (a picture, image encoder on the CPU).
 
+**Hibernate: give the GPU and RAM back without losing the conversations (opt-in, one GPU, no `--batch`).** Unloading
+drops the parked conversations (`--conversation-cache-mib`), so an agent's 150K-token sessions are read again from
+the start afterwards. With `"hibernate_dir": "C:\\Strata-data\\hibernate"` in the config (or `--hibernate-dir`),
+`POST /unload {"save": true}` first writes every parked conversation - and the live one - to that folder, each as a
+session file (the same format, model and configuration binding and checks as `/slots/0?action=save`, below; only the
+deepest checkpoint, as there), then `hibernate.txt` naming them, and ends the engine: its VRAM and RAM come straight
+back. While `hibernate.txt` exists the model is **hibernated**: a request answers **503** instead of loading the
+engine back over whatever has the GPU now, also after the server is restarted (it then starts unloaded).
+`POST /load {}` starts the engine with `--hibernate-dir`, which re-parks the conversations **before READY**, each
+admitted first (the cache's budget and slots, physical RAM above `--conversation-cache-min-free-mib`), so the first
+request already finds them. What the server does with the folder depends on the restore:
+- every conversation restored: `hibernate.txt` and its files are deleted;
+- some (the budget or RAM ran out part-way, or a file was refused): `hibernate.txt.partial` is kept;
+- files from another model, engine build or configuration, or damaged ones: `hibernate.txt.refused`, and the model
+  starts with an empty cache;
+- not enough RAM for the first conversation, or the conversation cache off: the hibernation **stays** - `POST /load`
+  answers 503 with the reason and the GPU stays free; free RAM (or fix the configuration) and resume again;
+- an engine that does not start with the folder: `hibernate.txt.unrestorable`, and it starts without it.
+
+The current conversation is written with SAVE's streaming write (straight from the device, a 16 MiB buffer) and its
+RAM check keeps only a 512 MiB margin, not the parking floor - the engine ends right after - so it is saved even when
+RAM is too tight to park it; if even that is refused, the parked conversations are still saved and `/unload` answers
+`"live_saved": false`. Measured on an RTX 3090 (24 GB) with 95 GB RAM, IQ3_S, Windows 11, a 116,093-token conversation:
+saved as a 2.0 GB file in 26.8 s, the engine ended and gave back 55 GB of RAM; on `/load` it was re-parked in 3.2 s
+before READY, and the next turn reused 116,086 tokens - its first token after 1.8 s, against 140-540 s to read the
+same prompt cold on that PC.
+
+`POST /load {"fresh": true}` moves `hibernate.txt` to `hibernate.txt.discarded` and starts clean; when it cannot be
+moved, nothing is loaded (500), so conversations meant to be discarded are never restored. A failed save (`SERR`,
+e.g. no disk space or RAM) leaves the engine running with every conversation still parked. The engine answers
+`HIBERNATED <n> <bytes> <ms>` with SAVE's `SESSION` progress lines, so a save of tens of GB is waited for as long as
+it moves. `tools/strata_suspend.py run -- <cmd>` wraps the cycle (suspend, retrying while busy; run the command;
+resume even if it fails), `launch -- <cmd>` runs the command in its own console and resumes when it exits, and the
+MCP tools `strata_suspend` / `strata_resume` do the same from an AI app.
+
+**Resuming only into free memory.** A hibernate records what the engine gave back - free RAM and VRAM after it ended,
+less before - as `resume-needs.json` beside `hibernate.txt`, and a resume first checks that this much is free again:
+RAM plus `"resume_margin_mib"` (default 4096), VRAM less 512 MiB of drift. When it is not (another program holds the
+memory), the model stays hibernated and the answer is **503 with `Retry-After: 30`** saying what is short; `/health`
+shows `resume_needs` and `resume_blocked`. `POST /load {"force": true}` resumes anyway. With `"resume_on_request": true`
+(opt-in) a request to a hibernated model resumes it (when the memory is free) instead of answering 503, waiting up to
+`"resume_wait_s"` (default 0) for the memory first. Measured on the RTX 3090 / 95 GB / Windows 11 PC, IQ3_S: the
+hibernate gave back 54,418 MiB of RAM and 23,198 MiB of VRAM; a chat request resumed the model and answered from the
+restored conversation in 17.3 s; with 28 GiB held by another process (50,128 MiB available, 58,398 needed) the request
+got its 503 at once and the engine was not started; freed, the next request resumed it in 15.2 s.
+With `"memory_check_on_load": true` (opt-in) a plain unload (`/unload`, an idle unload) records the same and a reload
+is checked the same way (503 + `Retry-After` while the memory is short, `{"force": true}` past it); without a
+hibernate folder the record is kept in memory only. Off, a plain reload loads as before and nothing is measured.
+
+**Partial hibernate: give only the RAM back (Windows, the pinned RAM expert arena).** `POST /unload {"save": true,
+"keep_gpu": true}` (also `/v1/unload`, `tools/strata_suspend.py --keep-gpu`, the MCP tool's `keep_gpu`) keeps the
+engine running with its VRAM - the weights, the GPU expert cache and the current conversation - and gives the RAM
+back: the engine (`RELEASE <dir>`) writes the parked conversations as a hibernate does, drops them from RAM, un-pins
+the expert arena and decommits its pages, keeping the address range. The model is hibernated as after a full one
+(503, or `"resume_on_request"`); the resume (`ACQUIRE <dir>`) commits the same addresses again, pins them, reads the
+experts again and re-parks the folder - no new engine, no CUDA start, no weights or cache to load. The resume checks
+the RAM only (the VRAM was never given back). An arena that cannot be taken again ends the engine (`FATAL`) and the
+server starts a new one with the folder (the current conversation is then lost); `/unload {"save": true}` while
+released takes the RAM back first and then hibernates fully. Measured on the RTX 3090 / 95 GB / Windows 11 PC, IQ3_S,
+two cycles: the release took 4.5-4.7 s and gave back ~47 GiB of RAM with the VRAM unchanged; a chat request resumed
+it in 6.7-7.0 s (the arena back in 5.6-6.0 s at 8.6-9.3 GiB/s), the current conversation answered from the GPU and
+the parked one came back from the folder; decode after the resume 87 and 115 tok/s; a full hibernate after a partial
+one, and its resume, kept the conversation. (A full hibernate's resume took 15-17 s.)
+
 **Giving part of the VRAM back while it keeps serving (#533, opt-in, one NVIDIA GPU; every request and answer:
 [VRAM_ELASTIC.md](VRAM_ELASTIC.md)).** With `"vram_elastic": true`
 in the config (the engine flag `--vram-elastic`), the expert cache is allocated in 512 MiB segments
@@ -968,8 +1032,11 @@ live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, 
 assistant turn and every 16K prompt tokens). A checkpoint is used only when the prompt starts with exactly its tokens
 and pictures. The oldest checkpoint - in practice the end of the system prompt, which every chat of the same client
 shares - is kept for good while the rest rotates by least recent use, so a NEW chat that shares that prefix starts
-reading after it instead of from token 0. A prompt read from the start is also checkpointed at the end of its system
-prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that root exists for agent clients with long
+reading after it instead of from token 0. "For good" holds only against prompts that share it: a prompt that shares
+none of it (for example another client's short request with its own system prompt) is read from token 0 over the
+same K/V, which drops every checkpoint, the root too, and the interrupted conversation comes back without a re-read
+only from a parked copy (the RAM cache or the disk tier below). A prompt read from the start is also checkpointed at
+the end of its system prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that root exists for agent clients with long
 system prompts and tool lists. Claude Code stamps its system prompt with a billing header that changes on every
 request (`cch=...`) and every session (the 4th part of `cc_version=`); the server pins both stamps (to `f`s, as
 llama.cpp does), so the system prompt and the tool list in front of it are the same prompt on every turn. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
@@ -1039,6 +1106,77 @@ snapshot's estimated size, less the K/V it already retains) and again after capt
 Unknown telemetry or insufficient RAM skips parking, and the same figure and floor
 decide whether a session file may be saved or restored (below). An 8 GiB budget
 is a cap, not a recommendation for every machine.
+
+**Parked conversations on the disk (opt-in, `--conversation-disk-dir DIR`).** A conversation the RAM cache above
+evicts (its slots or its byte budget full) is dropped, and a client that comes back to it reads the whole prompt
+again: an agent that alternates between its main conversation and sub-agents, two of them too large for the budget
+together, reads ~150K tokens again on every switch. With `--conversation-disk-dir DIR` the evicted conversation goes to
+`DIR` instead and comes back when a request continues it, through the same validation and restore as a parked one,
+when the disk holds a longer prefix than the session, a `--batch` slot or the RAM cache:
+
+- every image of it (one per stage with `--layer-split`) is one session file (above: the same writer and reader, so
+  the same size, header and hash checks and the free-space preflight `--session-min-free-mib`), with the live state
+  and every checkpoint, as in RAM (a checkpoint holds the recurrent state, not the K/V: a 333K-token conversation with
+  its 8 checkpoints is 6.2 GB; with the deepest one only, a prompt that left a 329K conversation at 220K read all
+  220K again); the files' identity is a random number of this run, so
+  only this engine reads them back, and its files (`strata-conv-*`) are removed at start and when it ends;
+- a park the physical-RAM admission refuses (its in-RAM snapshot would not fit beside the floor) is written straight
+  from the GPUs instead of dropped: only the running state passes through RAM and the checkpoints are lent to the files
+  (`sent to the disk` in the log). Its read-back is the same in reverse: when the whole image does not fit, the files'
+  K/V is streamed into the GPUs in 16 MiB pieces (`disk hit ... streamed into the GPU`), only the running state and the
+  checkpoints through RAM - measured here at 773 MB/s, a 3,048 MiB image in 4.1 s. A read back asks for its RAM with
+  the same `--conversation-cache-min-free-mib` floor as a park, so a box whose available RAM is at or under the floor
+  plus the running state and checkpoints reads the prompt again (`not enough RAM even for the running state`);
+- a background thread (CPU nice 10 on Linux) writes them, so a switch never waits for the disk; a conversation asked
+  for again before its write started comes back from RAM, one being written is waited for, then read. A queued image
+  holds its RAM until it is written: parking, and a read back, wait for the queue before they evict more;
+- `--conversation-disk-mib N` (default 32768): the files' total, oldest out first;
+- a read back removes it from the disk (the session holds it again, and it is parked again on the next switch);
+- the engine's log has a line for every queue, write, hit (from RAM or from the disk) and wait, with MiB, ms and MB/s,
+  and a totals line after every hit (`strata serve: conversation disk: ...`).
+
+Measured on 2x CMP 50HX (layer split), 2x Xeon E5-2670 v2, 64 GB RAM, NVMe ext4, Flash-Next IQ3_XXS, one RAM slot so
+that a third conversation pushes one to the disk, greedy (plain chat requests, 48 tokens): the follow-up answer
+of a conversation restored from the disk was the same text as the answer the live conversation gave (two
+conversations of 42K tokens, and the same through the RAM cache). A 165,557-token conversation: cold read 77.8 s; back
+from the disk 6.4 s for the whole request - the read 3.6 s (2,639 MiB in two files, 761 MB/s; measured when only the
+deepest checkpoint was kept) and the GPU restore 0.87 s. The background writes ran at 80-370 MB/s while the next
+prompt was being read (they share the CPU with it at a lower priority); a request waited for one once (0.9 s), when it
+asked for a conversation still being written. After the engine ended no file was left. Unit test:
+`conversation_disk_test` (CPU only, `-DSTRATA_BUILD_CONVERSATION_TESTS=ON`; also clean under ThreadSanitizer). Not run
+on Windows or HIP.
+
+**Conversations that outlive the engine (opt-in, `--conversation-disk-persist on|exit-only`, with
+`--conversation-disk-dir`; default `off`).**
+Who it is for: whoever does not keep Strata running all day - start it, continue yesterday's long session, stop it -
+and whoever restarts the server (an update, a settings change, a reboot). Without it every restart reads every
+conversation from token 0 again (77.6 s for 165K tokens below); with it the next start continues from the disk in
+seconds, paid for with disk space within `--conversation-disk-mib`.
+
+- the files are bound to the session files' identity (the model files' fingerprint, the engine version and the
+  settings that change the saved bytes) instead of a random number of the run; a small index file beside each
+  conversation (its token ids and write time, published by rename after its images) lets the next start take them in
+  without reading the images; files of another model, engine version or settings, a damaged index and leftovers of an
+  interrupted write are removed at start;
+- on QUIT (the server's stop, Ctrl+C, SIGTERM) the engine parks the current conversation, moves every parked one to
+  the disk and waits for the writes before it ends; the server waits up to 300 s for that (20 s otherwise). Ctrl+C in
+  the server's terminal no longer ends the engine directly (it is in the server's process group): the server's QUIT
+  does, after the save; a second Ctrl+C still ends it at once. A crash or `kill -9` keeps what was already written.
+
+Measured on the same box (one RAM slot; the 165,557-token conversation L current at the stop, two 42K-token ones
+parked): the save at the stop took 6.8 s (L written in 2.9 s, 2,639 MiB at 956 MB/s); the next start took in 3
+conversations (4,311 MiB) and refused none; after the restart all three came back from the disk with the same greedy
+answers as before it - L in 6.7 s instead of 77.6 s. `conversation_disk_test` covers the restart (files kept, taken in,
+read back exactly, another identity's files and a damaged index refused).
+
+`--conversation-disk-persist exit-only` keeps the same files for the next start but writes nothing while the engine
+runs: a conversation the RAM cache evicts is dropped (as without a disk folder), and QUIT writes the current and the
+parked ones. For a box that restarts more often than it switches between more conversations than its RAM holds: on
+our box (2x CMP 50HX, one person's agent sessions of 250-340K tokens) on one day the evictions' writes were never read
+back within a run - 40 writes, 197 GiB, and 34 requests waited 4.5 min in all for a write to finish - while both disk
+hits of the day came from the QUIT save. Tested there with three 13K-token conversations and a one-slot RAM cache:
+nothing written while the engine ran, two conversations written at QUIT, and after the next start the follow-up took
+12,912 of its 12,938 tokens from the disk.
 
 **The RAM figure (`available_host_bytes()`).** The headroom is the smallest of three
 numbers, sampled each time it is asked and not a reservation (other writers can take the
@@ -1435,6 +1573,19 @@ run is a slightly different model: the rescaled angles, and `yarn`'s magnitude c
 position, not only past the trained end. That is why the setup turns scaling on only for a context past
 262,144. Pictures read the same scaled table (their (t, h, w) positions feed it). That should work, but it is
 unmeasured: all the runs above are text.
+
+### PDFs and Office files in the chat page
+
+The chat page's attach button (or a drop) also takes **PDF, Word, Excel and PowerPoint** files: the server turns each
+into text with [MarkItDown](https://github.com/microsoft/markitdown) (`POST /convert`, only from Strata's own page) and
+it is attached like a text file, up to 50 MB per file and 1 MB of text. MarkItDown is optional:
+
+```
+.venv\Scripts\python -m pip install "markitdown[pdf,docx,xlsx,pptx]"
+```
+
+There is no OCR: a scanned PDF has no text layer and is refused with "No text found" (turn on images and attach the
+pages as pictures instead).
 
 ---
 

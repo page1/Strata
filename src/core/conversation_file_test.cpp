@@ -628,6 +628,166 @@ int main() {
         check(session_phase_limit_s(0) == 60 && session_phase_limit_s(1198691396) == 60 + (1198691396 >> 22) &&
               session_phase_limit_s(UINT64_MAX) == 3600, "phase limit: 60 s + 1 s per 4 MiB, at most an hour");
     }
+    // delta files (the disk tier's chains): a delta holds what changed since its parent; the chain reads back exactly
+    {
+        auto sources_of = [](const SavedConversation& img) {
+            std::vector<SessionKvSource> out;
+            for (const auto& kv : img.kv) {
+                SessionKvSource s;
+                s.format = kv.format; s.cells = kv.cells; s.heads = kv.heads; s.head_dim = kv.head_dim;
+                s.page_size = kv.page_size; s.pooled_rows = kv.pooled_rows; s.idx_dim = kv.idx_dim;
+                std::array<const ConversationBuffer*, 5> parts = {&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
+                for (size_t p = 0; p < 5; ++p) s.sizes[p] = parts[p]->size();
+                s.read = [parts](size_t part, size_t offset, void* dst, size_t n) { return parts[part]->read(dst, offset, n); };
+                out.push_back(std::move(s));
+            }
+            return out;
+        };
+        auto parts_of = [](const SavedConversation& img, size_t l) {
+            const auto& kv = img.kv[l];
+            return std::array<const ConversationBuffer*, 5>{&kv.k, &kv.v, &kv.k_scale, &kv.v_scale, &kv.pooled};
+        };
+        // per layer and part: all of it when unchanged, else 0 (the caller sets the real prefixes)
+        auto unchanged = [&](const SavedConversation& now, const SavedConversation& was) {
+            std::vector<std::array<uint64_t, 5>> pre;
+            for (size_t l = 0; l < now.kv.size(); ++l) {
+                std::array<uint64_t, 5> p{};
+                const auto a = parts_of(now, l), b = parts_of(was, l);
+                for (size_t k = 0; k < 5; ++k) p[k] = *a[k] == *b[k] ? a[k]->size() : 0;
+                pre.push_back(p);
+            }
+            return pre;
+        };
+        const fs::path c0 = dir / "chain0.bin", c1 = dir / "chain1.bin", c2 = dir / "chain2.bin", other = dir / "other.bin";
+        uint64_t h0 = 0, p0 = 0;
+        std::vector<SessionPartChunks> ch0;
+        SessionWriteOptions w0;
+        w0.payload_hash = &h0; w0.payload_bytes = &p0; w0.chunks = &ch0;
+        size_t base_bytes = 0;
+        check(session_file_write(c0.string(), original, id, base_bytes, error, w0) && p0 == base_bytes - 80,
+              "delta: the base is a session file; its payload hash and length reported");
+        check(ch0.size() == 3 && ch0[0].part[0].size() == 17 && ch0[1].part[0].empty(),
+              "delta: chunk hashes for the whole MiBs of each part (17 of layer 0's k)");
+        std::vector<uint8_t> chunk(kSessionChunkBytes);
+        original.kv[0].k.read(chunk.data(), 3 * kSessionChunkBytes, chunk.size());
+        check(ch0[0].part[0][3] == session_chunk_hash(chunk.data(), chunk.size()), "delta: a chunk hash is session_chunk_hash of its bytes");
+        // B: layer 0's k rewritten from 13 MiB on and 2 MiB longer, layer 1's v replaced, a new live state; the first
+        // checkpoint kept (a reference), a new one written
+        SavedConversation b = original;
+        b.kv[0].k.resize(b.kv[0].k.size() + (2u << 20));
+        b.kv[0].k.visit(13u << 20, b.kv[0].k.size() - (13u << 20), [](uint8_t* p, size_t n, size_t at) {
+            for (size_t i = 0; i < n; ++i) p[i] = uint8_t((at + i) * 7 + 3);
+            return true;
+        });
+        b.kv[1].v = pattern(5000, 99);
+        b.live = checkpoint(1300, 7);
+        b.checkpoints = {original.checkpoints[0], checkpoint(1200, 8)};
+        SavedConversation mb = b;
+        mb.kv.clear();
+        SessionDelta db;
+        db.parent_hash = h0; db.parent_payload = p0;
+        db.checkpoint_refs = {0, -1};
+        db.prefix = unchanged(b, original);
+        db.prefix[0][0] = 13u << 20;
+        uint64_t h1 = 0, p1 = 0;
+        std::vector<SessionPartChunks> ch1;
+        SessionWriteOptions w1;
+        w1.payload_hash = &h1; w1.payload_bytes = &p1; w1.chunks = &ch1;
+        size_t d1_bytes = 0;
+        const auto src_b = sources_of(b);
+        check(session_delta_write(c1.string(), mb, src_b, db, id, d1_bytes, error, w1), "delta: written");
+        check(d1_bytes < base_bytes / 2, "delta: much smaller than the base (only the changes)");
+        check(ch1[0].part[0].size() == (b.kv[0].k.size() - (13u << 20)) / kSessionChunkBytes,
+              "delta: its chunk hashes start at the prefix");
+        SavedConversation back;
+        size_t n = 0;
+        std::vector<uint64_t> hashes;
+        check(session_chain_read({c0.string(), c1.string()}, id, back, nullptr, n, error, {}, nullptr, &hashes) &&
+                  same(back, b) && n == base_bytes + d1_bytes && hashes == std::vector<uint64_t>{h0, h1},
+              "delta: the chain reads back the new image exactly");
+        {   // streamed into targets
+            using Bytes = std::vector<uint8_t>;
+            std::vector<std::array<Bytes, 5>> got(b.kv.size());
+            std::vector<SessionKvTarget> tg;
+            for (size_t l = 0; l < b.kv.size(); ++l) {
+                const auto& kv = b.kv[l];
+                SessionKvTarget t;
+                t.format = kv.format; t.cells = kv.cells; t.heads = kv.heads; t.head_dim = kv.head_dim;
+                t.page_size = kv.page_size; t.pooled_rows = kv.pooled_rows; t.idx_dim = kv.idx_dim;
+                const auto parts = parts_of(b, l);
+                for (size_t p = 0; p < 5; ++p) { t.sizes[p] = parts[p]->size(); got[l][p].assign(t.sizes[p], 0); }
+                std::array<Bytes, 5>* layer = &got[l];
+                t.write = [layer](size_t part, size_t offset, const void* src, size_t c) {
+                    std::memcpy((*layer)[part].data() + offset, src, c);
+                    return true;
+                };
+                tg.push_back(std::move(t));
+            }
+            SavedConversation meta;
+            bool exact = session_chain_read({c0.string(), c1.string()}, id, meta, &tg, n, error) &&
+                         same_checkpoint(meta.live, b.live) && meta.checkpoints.size() == 2 && meta.kv[0].k.size() == 0;
+            for (size_t l = 0; exact && l < b.kv.size(); ++l) {
+                const auto parts = parts_of(b, l);
+                for (size_t p = 0; exact && p < 5; ++p) {
+                    Bytes want(parts[p]->size());
+                    parts[p]->read(want.data(), 0, want.size());
+                    exact = got[l][p] == want;
+                }
+            }
+            check(exact, "delta: the chain streamed into targets holds the new K/V exactly");
+        }
+        check(!session_file_read(c1.string(), id, back, n, error) && error.find("unsupported version") != std::string::npos,
+              "delta: a delta alone is not a session file (version 2 refused)");
+        SavedConversation o2 = original;
+        o2.live = checkpoint(1000, 50);
+        size_t other_bytes = 0;
+        check(session_file_write(other.string(), o2, id, other_bytes, error) &&
+                  !session_chain_read({other.string(), c1.string()}, id, back, nullptr, n, error) &&
+                  error.find("another parent") != std::string::npos,
+              "delta: a delta read against another parent is refused");
+        // C: layer 0's k cut back to 5 MiB then 3 MiB of new bytes (a rewind), B's new checkpoint kept, the first one
+        // dropped
+        SavedConversation c = b;
+        c.kv[0].k.resize(5u << 20);
+        c.kv[0].k.resize(8u << 20, 0x5a);
+        c.checkpoints = {b.checkpoints[1]};
+        c.live = checkpoint(900, 9);
+        SavedConversation mc = c;
+        mc.kv.clear();
+        SessionDelta dc;
+        dc.parent_hash = h1; dc.parent_payload = p1;
+        dc.checkpoint_refs = {1};
+        dc.prefix = unchanged(c, b);
+        dc.prefix[0][0] = 5u << 20;
+        size_t d2_bytes = 0;
+        const auto src_c = sources_of(c);
+        check(session_delta_write(c2.string(), mc, src_c, dc, id, d2_bytes, error) &&
+                  session_chain_read({c0.string(), c1.string(), c2.string()}, id, back, nullptr, n, error) && same(back, c),
+              "delta: a chain of three (one shorter again, a checkpoint dropped) reads back exactly");
+        check(!session_chain_read({c0.string(), c2.string()}, id, back, nullptr, n, error), "delta: a link left out is refused");
+        SessionDelta bad = db;
+        bad.checkpoint_refs = {5, -1};
+        check(session_delta_write(c2.string(), mb, src_b, bad, id, d2_bytes, error) &&
+                  !session_chain_read({c0.string(), c2.string()}, id, back, nullptr, n, error) &&
+                  error.find("does not hold") != std::string::npos,
+              "delta: a reference to a checkpoint the chain does not hold is refused");
+        bad = db;
+        bad.prefix[0][0] = 1234;
+        check(!session_delta_write(c2.string(), mb, src_b, bad, id, d2_bytes, error) &&
+                  error.find("whole chunk") != std::string::npos,
+              "delta: a prefix that is not a whole chunk is refused at write");
+        auto flipped = slurp(c0);
+        flipped[flipped.size() / 2] ^= 0x10;
+        spit(other, flipped);
+        check(!session_chain_read({other.string(), c1.string()}, id, back, nullptr, n, error) &&
+                  error.find("checksum mismatch at chain position 0") != std::string::npos,
+              "delta: a corrupt base refuses the chain");
+        ConversationCheckpoint x = checkpoint(10, 2), y = checkpoint(10, 2);
+        check(session_checkpoint_hash(x) == session_checkpoint_hash(y) &&
+                  (y.gdn[7] ^= 1, session_checkpoint_hash(x) != session_checkpoint_hash(y)),
+              "delta: the checkpoint hash follows its state");
+        for (const auto& p : {c0, c1, c2, other}) fs::remove(p);
+    }
     // A: the SAVE's RAM preflight comes BEFORE the checkpoint is copied
     {
         std::vector<ConversationCheckpoint> chain;

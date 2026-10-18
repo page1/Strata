@@ -4484,6 +4484,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 
     // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
     const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
+    path_ = path;                    // what a partial hibernate's reacquire_memory reads again
+    from_gguf_ = from_gguf;
+    load_threads_ = threads;
+    released_ = false;
     // SIZE CHECK BEFORE THE ALLOCATION, not after.  A wrong pack should name the two numbers rather than spend
     // 34 GB and a minute of loading first.
     if (from_gguf) {
@@ -4797,6 +4801,69 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     load_read_s_ = st.read_seconds;
     load_copy_s_ = st.copy_seconds;
     record_inputs(path, gguf_, lay, from_gguf);
+    return true;
+}
+
+bool ArenaExpertSource::release_memory(std::string& err) {
+    auto* a = (PinnedArena*) arena_;
+    if (a == nullptr || map_ != nullptr) {
+        err = "there is no pinned RAM arena to give back (--mmap-experts or STRATA_ARENA_MMAP)";
+        return false;
+    }
+    if (released_) return true;
+    if (!a->release_pages(err)) return false;
+    dev_slice_.clear();
+    pinned_bytes_ = 0;
+    released_ = true;
+    return true;
+}
+
+bool ArenaExpertSource::reacquire_memory(std::string& err) {
+    if (!released_) return true;
+    auto* a = (PinnedArena*) arena_;
+    if (a == nullptr || !a->reacquire_pages(err)) return false;
+    pinned_bytes_ = a->registered_bytes;
+    dev_slice_.clear();
+    void* d = nullptr;
+    if (cudaHostGetDevicePointer(&d, (void*) base_, 0) == cudaSuccess && d != nullptr) {
+        dev_slice_.push_back((const uint8_t*) d);
+    } else {
+        (void) cudaGetLastError();
+    }
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    std::vector<std::string> files;
+    if (from_gguf_) {
+        for (int64_t l = 0; l < lay.n_layers; ++l)
+            for (int r = 0; r < 3; ++r) {
+                const std::string f = expert_gguf_file(gguf_, lay, l, r);
+                if (std::find(files.begin(), files.end(), f) == files.end()) files.push_back(f);
+            }
+    } else {
+        files.push_back(path_);
+    }
+    std::string why;
+    const bool unbuffered = experts_unbuffered(files, a->capacity, why);
+    const int readers = unbuffered ? std::max(load_threads_, 16) : load_threads_;
+    LoadStats st;
+    if (from_gguf_) {
+        st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, nullptr);
+    } else {
+        std::vector<uint64_t> loff, lbytes;
+        for (int64_t l = 0; l < lay.n_layers; ++l) {
+            loff.push_back(lay.layer_offset(l));
+            lbytes.push_back(lay.blob_bytes(l) * (uint64_t) lay.n_expert);
+        }
+        if (unbuffered) st = load_experts_direct(path_, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, nullptr);
+        if (!unbuffered || (!st.ok && st.error.empty()))
+            st = load_experts_ranges(path_, a->data(), loff, lbytes, load_threads_, /*chunk=*/8u << 20, nullptr);
+    }
+    if (!st.ok || st.bytes != lay.total) {
+        err = "the experts could not be read again: " + (st.error.empty() ? std::string("a short read") : st.error);
+        return false;
+    }
+    gib_per_s_ = st.gib_per_second();
+    load_seconds_ = st.seconds;
+    released_ = false;
     return true;
 }
 

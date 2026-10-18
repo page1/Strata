@@ -745,6 +745,7 @@ class StrataEngine:
     """
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
+    detach_console = False               # local "save_on_close" (Windows): main() sets it before the first start
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
@@ -815,7 +816,14 @@ class StrataEngine:
         pin = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
+        # --conversation-disk-persist on|exit-only: at QUIT the engine first writes its conversations to the disk (GBs)
+        persist = args[args.index("--conversation-disk-persist") + 1] if "--conversation-disk-persist" in args else "off"
+        self.quit_s = 20 if persist == "off" else 300
         spawned_at = time.monotonic()
+        if os.name == "nt" and StrataEngine.detach_console:
+            # local "save_on_close": the engine gets no console, so closing the window does not end it with the server
+            # (serve/winclose.py); Ctrl+C then reaches only the server, whose stop sends QUIT
+            pin["creationflags"] = subprocess.CREATE_NO_WINDOW
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
@@ -840,6 +848,10 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+            if line.startswith("HIBERNATE "):        # hibernate/resume: the restore report, before READY
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    self.info["hibernate_" + k] = int(v) if v.isdigit() else v
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -2040,14 +2052,59 @@ class StrataEngine:
         that never ends is still ended."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        return self._session_exchange(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}",
+                                      "SAVED" if action == "save" else "RESTORED", f"session {action}")
+
+    def hibernate(self, directory: str) -> dict:
+        """Hibernate/resume: `HIBERNATE <dir>` between requests (the caller holds the service FIFO) - the engine parks
+        the live conversation, writes every parked one to `dir` as a session file and then `dir/hibernate.txt` (the
+        latch), and answers `HIBERNATED <n> <bytes> <ms>`.  Same exchange as SAVE (session_file): SESSION / SWAIT keep
+        the wait alive while the files move, SERR is SessionRefused (the engine keeps running, nothing was saved),
+        anything out of step ends the engine.  -> {"saved", "bytes", "ms"}."""
+        if any(c in directory for c in "\r\n\0"):
+            raise ValueError("invalid hibernate folder")
+        r = self._session_exchange(f"HIBERNATE {directory}", "HIBERNATED", "hibernate")
+        return {"saved": r["tokens"], "bytes": r["bytes"], "ms": r["ms"], **({"live": r["live"]} if "live" in r else {})}
+
+    def release(self, directory: str) -> dict:
+        """Partial hibernate: `RELEASE <dir>` - the engine writes the parked conversations as HIBERNATE does (not the
+        current one, which stays on the GPU), drops them from RAM and gives the expert arena's RAM back, staying up
+        with its VRAM: `RELEASED <n> <bytes> <ms> freed=<bytes>`.  SERR is SessionRefused (nothing changed).
+        -> {"saved", "bytes", "ms", "freed"}."""
+        if any(c in directory for c in "\r\n\0"):
+            raise ValueError("invalid hibernate folder")
+        r = self._session_exchange(f"RELEASE {directory}", "RELEASED", "release")
+        self.released = True
+        return {"saved": r["tokens"], "bytes": r["bytes"], "ms": r["ms"], "freed": r.get("freed")}
+
+    def acquire(self, directory: str) -> dict:
+        """Partial hibernate's resume: `ACQUIRE <dir>` - the engine takes the arena's RAM again, reads the experts
+        and re-parks the folder's conversations: `ACQUIRED restored=N of=M bytes=B status=S ms=T`.  FATAL (the arena
+        could not be taken again) is EngineDied: the engine has ended. -> {"restored", "of", "bytes", "status", "ms"}."""
+        if any(c in directory for c in "\r\n\0"):
+            raise ValueError("invalid hibernate folder")
+        r = self._session_exchange(f"ACQUIRE {directory}", "ACQUIRED", "resume")
+        self.released = False
+        return r
+
+    def set_hibernate_arg(self, directory: str | None) -> None:
+        """Put (or clear) `--hibernate-dir <dir>` in the spawn args, so the next start re-parks the folder."""
+        args = self.spawn[1]
+        while "--hibernate-dir" in args:
+            i = args.index("--hibernate-dir")
+            del args[i:i + 2]
+        if directory:
+            args += ["--hibernate-dir", str(directory)]
+
+    def _session_exchange(self, command: str, want: str, what: str) -> dict:
+        """The exchange behind session_file and hibernate: send `command`, then wait for `<want> <n> <bytes> <ms>`."""
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write(command + "\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -2056,7 +2113,7 @@ class StrataEngine:
                 self.proc.wait(timeout=20)
             except (OSError, AttributeError, subprocess.TimeoutExpired):
                 pass
-            return EngineDied(f"the engine answered a session {action} with {line.strip()[:200]!r}; "
+            return EngineDied(f"the engine answered a {what} with {line.strip()[:200]!r}; "
                               "the server ended the engine")
 
         def count(s: str) -> int:
@@ -2074,7 +2131,7 @@ class StrataEngine:
                     raise queue.Empty
                 line = self.lines.get(timeout=left)
             except queue.Empty:
-                raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
+                raise self._silent(f"the engine said nothing for {limit:.0f} s during a {what}"
                                    + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")) from None
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -2110,16 +2167,33 @@ class StrataEngine:
                 if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
                     raise out_of_step(line)
                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
+            if head == want == "ACQUIRED":                # key=value fields
+                try:
+                    kv = dict(x.split("=", 1) for x in f[1:])
+                    out = {k: count(kv[k]) for k in ("restored", "of", "bytes")}
+                    out["status"] = kv["status"]
+                    out["ms"] = float(kv["ms"])
+                    if not out["status"].isalpha() or not math.isfinite(out["ms"]) or out["ms"] < 0:
+                        raise ValueError
+                except (ValueError, KeyError):
+                    raise out_of_step(line) from None
+                return out
             if head == want:
                 try:
-                    if len(f) != 4:
+                    # HIBERNATED alone may add live=0|1 (was the current conversation saved), RELEASED freed=<bytes>
+                    extra = f[4:] if want == "HIBERNATED" and len(f) == 5 and f[4] in ("live=0", "live=1") else None
+                    freed = None
+                    if want == "RELEASED" and len(f) == 5 and f[4].startswith("freed="):
+                        freed, extra = count(f[4][6:]), []
+                    if len(f) != 4 and extra is None:
                         raise ValueError
                     tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
                     if not math.isfinite(ms) or ms < 0:
                         raise ValueError
                 except ValueError:
                     raise out_of_step(line) from None
-                return {"tokens": tokens, "bytes": size, "ms": ms}
+                return {"tokens": tokens, "bytes": size, "ms": ms,
+                        **({"live": int(extra[0][5:])} if extra else {}), **({"freed": freed} if freed is not None else {})}
             if head == "INFO" or head == "WARN":          # engine log lines may interleave; they are not answers
                 heard = time.monotonic()
                 continue
@@ -2136,7 +2210,7 @@ class StrataEngine:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=getattr(self, "quit_s", 20))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=20)
@@ -2606,6 +2680,14 @@ def engine_args(cfg: dict) -> list[str]:
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
 
 
+def disk_persist_mode(args: list[str]) -> str:
+    """--conversation-disk-persist's value (#1937: off|on|exit-only); "off" when absent or without a value."""
+    if "--conversation-disk-persist" not in args:
+        return "off"
+    i = args.index("--conversation-disk-persist") + 1
+    return args[i] if i < len(args) and args[i] in ("off", "on", "exit-only") else "off"
+
+
 def parallel_args(cfg: dict, args: list[str]) -> list[str]:
     """#465 (opt-in): "parallel": N in the config - up to N requests decode together in the engine's batch slots
     (--batch N); more wait their turn.  1 or absent: one request at a time, as before.  A value the engine cannot use
@@ -3040,6 +3122,12 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        self.holds_lock = threading.Lock()              # local: writers of the holds file (several jobs at once)
+        self.agent_sessions = {}                        # local: opencode session id -> its request (status_lock)
+        self.req_local = threading.local()              # local: this thread's request (its key in agent_sessions)
+        self.req_seq = 0
+        self._session_info = {}                         # local: opencode session id -> (when, its title, parent, task)
+        self.suspends_in_flight = 0                     # local: held suspends still stopping the engine (holds_lock)
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -3085,12 +3173,29 @@ class Service:
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
         self.idle_unload_s = 0
+        self.idle_release_s = 0                         # local: give the RAM back (keep the GPU) after this idle
         self.min_free_vram_mib = 0
         self.before_load = None
         self.before_load_timeout_s = 120.0               # #1997: how long the before_load command may run
         self.before_load_ignore_failure = False          # #1997: load even when it fails, without a VRAM check
         self.vram_free_wait_s = 15.0                     # how long a full card is waited on (memory given back)
         self.before_load_strict = False                  # #1997: refuse (503) whenever it fails
+        self.hibernate_dir = None                        # hibernate/resume: the folder (its hibernate.txt is the latch)
+        self.last_hibernate = None                       # the engine's last HIBERNATED answer (saved, bytes, ms, live)
+        # local: the engine runs --conversation-disk-persist (main() sets it).  A full hibernate is then QUIT (the
+        # engine writes to its disk tier only what is not there yet) plus a "mode disk" latch; a resume is a plain
+        # start, and each conversation comes back from the disk when a request continues it.
+        self.disk_persist = False
+        # "resume_on_request": a request to a hibernated model resumes it - only once the RAM and VRAM its hibernate
+        # gave back are free again (resume_needs; plus "resume_margin_mib" of RAM), waiting up to "resume_wait_s"
+        # for them; else 503 with Retry-After.  Off: 503 until POST /load, as before.
+        self.resume_on_request = False
+        self.resume_margin_mib = 4096
+        self.resume_wait_s = 0.0
+        # "memory_check_on_load": the same check before a plain reload (after /unload, an idle unload): every unload
+        # records what it gave back (also kept in memory when there is no hibernate folder).  Off: it loads as before.
+        self.memory_check_on_load = False
+        self._needs = None                               # the last unload's record (RAM / VRAM MiB)
         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
         self.vram_reserve_asked = False                  # a POST /v1/vram was made (vram_reserve None is then asked)
         self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
@@ -3106,7 +3211,535 @@ class Service:
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
     def loaded(self) -> bool:
-        return not hasattr(self.engine, "alive") or self.engine.alive()
+        """Running and serving: not while a partial hibernate has the engine's RAM given back (it is alive then)."""
+        return (not hasattr(self.engine, "alive") or self.engine.alive()) and not self.released()
+
+    def released(self) -> bool:
+        """A partial hibernate (/unload {"save": true, "keep_gpu": true}): the engine runs with its VRAM, its RAM
+        given back, until a resume (ACQUIRE)."""
+        return bool(getattr(self.engine, "released", False)) and \
+            (not hasattr(self.engine, "alive") or self.engine.alive())
+
+    # ---- hibernate/resume: the folder's hibernate.txt (written by the engine's HIBERNATE) is the latch
+
+    def _hibernate_manifest(self) -> Path | None:
+        return Path(self.hibernate_dir) / "hibernate.txt" if self.hibernate_dir else None
+
+    def hibernated(self) -> bool:
+        """While the folder's manifest exists the model stays unloaded - a request answers 503 instead of loading the
+        engine back over whatever is using the GPU - until POST /load (which restores the conversations) or
+        POST /load {"fresh": true} (which discards them).  A file, so it survives a server restart."""
+        m = self._hibernate_manifest()
+        return m is not None and m.exists()
+
+    # ---- local: holds.  A suspend can be held by running processes (a long job): while any of them lives, nothing
+    # resumes the model - not resume_on_request, not POST /load (only {"force": true}) - so no agent window brings it
+    # back over the job.  When the last one has ended, however it ended (finished, crashed, killed), the watcher
+    # resumes the model by itself.  A file in the hibernate folder, so it survives a server restart; each holder is
+    # its pid plus the process's start time, so a reused pid never keeps a hold alive.
+
+    HOLDS = "holds.json"
+    HOLD_RETRY_S = 60
+
+    def _holds_file(self) -> Path | None:
+        return Path(self.hibernate_dir) / self.HOLDS if self.hibernate_dir else None
+
+    def _read_holds_state(self) -> tuple[list[dict], bool]:
+        """(the holders, resume): resume is whether the model was loaded when the first of them suspended it - then
+        the last holder's end resumes it; else it stays as it was.  An older file (a bare list) means resume."""
+        f = self._holds_file()
+        data = []
+        for attempt in range(20):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8")) if f else []
+                break
+            except FileNotFoundError:
+                data = []
+                break
+            except ValueError:                           # not JSON: written whole and replaced, so it is damaged (a
+                try:                                     # power cut can leave it empty) - set aside, not trusted
+                    f.replace(f.with_name(f.name + ".bad"))
+                    print(f"[strata] hold: {f} was damaged; set aside as {f.name}.bad", flush=True)
+                except OSError:
+                    pass
+                data = []
+                break
+            except OSError:                              # Windows: replaced or scanned right now - try again, then
+                if attempt == 19:                        # fail closed (the callers count an unreadable file as held)
+                    raise OSError(f"cannot read {f}") from None
+                time.sleep(0.05)
+        resume, holders = (bool(data.get("resume", True)), data.get("holders")) if isinstance(data, dict) else \
+            (True, data)
+        return [h for h in (holders or []) if isinstance(h, dict) and isinstance(h.get("pid"), int)], resume
+
+    def _read_holds(self) -> list[dict]:
+        return self._read_holds_state()[0]
+
+    def _write_holds(self, holders: list[dict], resume: bool) -> None:
+        """The caller holds self.holds_lock."""
+        f = self._holds_file()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_name(f.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as out:
+            out.write(json.dumps({"resume": resume, "holders": holders}))
+            out.flush()
+            os.fsync(out.fileno())                       # on the disk before it replaces the old one (power cuts)
+        for attempt in range(20):                        # Windows: no replace while a reader (held_by) has it open
+            try:
+                tmp.replace(f)
+                return
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.05)
+
+    @staticmethod
+    def _holder_alive(h: dict) -> bool:
+        try:
+            import psutil
+            p = psutil.Process(h["pid"])
+            return abs(p.create_time() - float(h.get("started") or 0)) < 1.0 and p.status() != psutil.STATUS_ZOMBIE
+        except Exception:  # noqa: BLE001 - no such process (or no access): not a live holder
+            return False
+
+    def held_by(self) -> list[int]:
+        """The live holders' pids ([] when nothing holds the model).  A read: no lock (the file is replaced whole).
+        An unreadable file counts as held ([0]): nothing loads the model over a job it cannot see."""
+        try:
+            return [h["pid"] for h in self._read_holds() if self._holder_alive(h)]
+        except OSError:
+            return [0]
+
+    def set_hold_resume(self) -> None:
+        """This request's suspend stopped a running model: the last holder's end brings it back."""
+        with self.holds_lock:
+            f = self._holds_file()
+            if f and f.exists():
+                holders, _ = self._read_holds_state()
+                self._write_holds(holders, True)
+
+    def drop_ended_holds(self) -> None:
+        """A deliberate hibernate without holders: a resume still pending from ended holders (memory was not free)
+        must not bring the model back later."""
+        with self.holds_lock:
+            f = self._holds_file()
+            try:
+                if f and f.exists() and not self.suspends_in_flight and \
+                        not any(self._holder_alive(h) for h in self._read_holds()):
+                    f.unlink()
+            except OSError:
+                pass
+
+    def add_holds(self, pids, resume: bool = True) -> list[int]:
+        """Hold the model for these running processes (added to the live holders).  resume: the model was loaded
+        when they suspended it (kept if an earlier holder's suspend had it loaded).  -> the pids now held for;
+        ValueError when one is not a running process."""
+        import psutil
+        new = []
+        for pid in pids:
+            try:
+                new.append({"pid": int(pid), "started": psutil.Process(int(pid)).create_time()})
+            except (psutil.Error, ValueError, TypeError) as e:
+                raise ValueError(f"pid {pid} is not a running process ({e})") from None
+        with self.holds_lock:                            # several jobs at once: no holder lost between read and write
+            f = self._holds_file()
+            old, old_resume = self._read_holds_state()
+            keep = [h for h in old if self._holder_alive(h) and h["pid"] not in {n["pid"] for n in new}]
+            self._write_holds(keep + new, resume or (f.exists() and old_resume))
+            held = [h["pid"] for h in keep + new]
+        print(f"[strata] held by pid {', '.join(map(str, held))}: nothing resumes the model until "
+              f"{'it ends' if len(held) == 1 else 'they all end'}", flush=True)
+        return held
+
+    def release_holds(self, pids=None) -> list[int]:
+        """pids: these holders are done (each job's wrapper releases only its own) -> the live holders left; the
+        caller then runs check_holds, which resumes the model once none is left.  None: every hold ends at once
+        (POST /hold {"release": true}, an explicit resume).  Done holders that no longer run are accepted too."""
+        with self.holds_lock:
+            f = self._holds_file()
+            if not (f and f.exists()):
+                return []
+            if pids is None:
+                try:
+                    f.unlink()
+                    print("[strata] hold released", flush=True)
+                except OSError as e:
+                    print(f"[strata] could not remove {f} ({e})", flush=True)
+                return []
+            done = {int(p) for p in pids}
+            holders, resume = self._read_holds_state()
+            left = [h for h in holders if h["pid"] not in done]
+            self._write_holds(left, resume)              # kept even when empty: check_holds decides the resume
+            return [h["pid"] for h in left if self._holder_alive(h)]
+
+    AGENT_RECENT_S = 180                         # a session whose request ended this recently is between two steps
+
+    @contextlib.contextmanager
+    def agent_request(self, headers, path=None):
+        """Local: every request while it runs - queued for the turn, waiting out a hold, loading the model,
+        generating - with who sent it.  An opencode session (opencode sends x-opencode-session-id) stays listed for
+        AGENT_RECENT_S after (its tools run between two steps); the heartbeat writes those every minute, so after a
+        crash it says who was working.  A request without a session (the web page, another tool) is listed while
+        it runs, by the program that sent it."""
+        sid = (headers.get("x-opencode-session-id") or headers.get("x-session-id")) if headers else None
+        ua = (headers.get("User-Agent") or "") if headers else ""
+        client = "opencode" if ua.startswith("opencode") else "web page" if "Mozilla" in ua else \
+            (ua.split("/")[0] or "a client")
+        with self.status_lock:
+            self.req_seq += 1
+            key = sid or f"request {self.req_seq}"
+            self.agent_sessions[key] = {"state": "queued", "since": time.time(), "active": True, "session": sid,
+                                        "client": client, "path": path}
+        self.req_local.key = key
+        try:
+            yield key
+        finally:
+            self.req_local.key = None
+            with self.status_lock:
+                if key in self.agent_sessions:
+                    if sid:
+                        self.agent_sessions[key].update(state="between steps", active=False, ended=time.time())
+                    else:
+                        del self.agent_sessions[key]
+
+    def this_request_is(self, state: str) -> None:
+        self.agent_state(getattr(self.req_local, "key", None), state)
+
+    SESSION_INFO_S = 30.0
+
+    def requests_now(self) -> list:
+        """The requests running now, in order (generating first, then the waiting ones by arrival), each with who
+        sent it: the opencode session's title and agent, and for a subagent its parent session and the task it was
+        given (tools/strata_jobs.py session_info, cached SESSION_INFO_S)."""
+        now = time.time()
+        with self.status_lock:
+            active = [(k, dict(r)) for k, r in self.agent_sessions.items() if r.get("active")]
+        out = []
+        for key, r in active:
+            entry = {"state": r["state"], "waiting_s": round(now - r["since"]), "client": r.get("client"),
+                     "session": r.get("session")}
+            sid = r.get("session")
+            if sid:
+                cached = self._session_info.get(sid)
+                if not cached or now - cached[0] > self.SESSION_INFO_S:
+                    try:
+                        sys.path.insert(0, str(ROOT / "tools"))
+                        import strata_jobs
+                        cached = (now, strata_jobs.session_info(sid))
+                    except Exception:  # noqa: BLE001 - who sent it is a help, never a failure
+                        cached = (now, {})
+                    self._session_info[sid] = cached
+                entry.update(cached[1])
+            out.append(entry)
+        out.sort(key=lambda e: (e["state"] != "generating", -e["waiting_s"]))
+        return out
+
+    def agent_state(self, sid, state: str) -> None:
+        if sid:
+            with self.status_lock:
+                if sid in self.agent_sessions:
+                    self.agent_sessions[sid]["state"] = state
+
+    def live_requests(self) -> dict:
+        """The sessions with a request now, or one that ended in the last AGENT_RECENT_S."""
+        now = time.time()
+        with self.status_lock:
+            for sid in [s for s, r in self.agent_sessions.items()
+                        if not r.get("active") and now - r.get("ended", now) > self.AGENT_RECENT_S]:
+                del self.agent_sessions[sid]
+            return {sid: dict(r) for sid, r in self.agent_sessions.items()}
+
+    HOLDERS_CACHE_S = 5.0
+
+    def holders(self) -> list | None:
+        """Local: who holds the model, for /health and the Monitor (tools/strata_jobs.py describe_holders: the job's
+        command, folder, agent session, restarts); cached a few seconds - the page asks every second."""
+        held = self.held_by()
+        if not held:
+            return None
+        now = time.time()
+        cached = getattr(self, "_holders_cache", None)
+        if cached and cached[0] == held and now - cached[1] < self.HOLDERS_CACHE_S:
+            return cached[2]
+        try:
+            sys.path.insert(0, str(ROOT / "tools"))
+            import strata_jobs
+            out = strata_jobs.describe_holders(held)
+            for h in out:
+                h["advice"] = strata_jobs.advice(h)
+        except Exception as e:  # noqa: BLE001 - the details are a help, never a failure
+            out = [{"pids": held, "command": None, "advice": f"(no details: {e})"}]
+        self._holders_cache = (held, now, out)
+        return out
+
+    def check_holds_quietly(self) -> str:
+        """check_holds for a request that waited out a hold: a holds-file error is left to the watcher."""
+        try:
+            return self.check_holds()
+        except OSError:
+            return ""
+
+    def check_holds(self) -> str:
+        """The watcher's step, also run right after a release: "" (no holds file), "held" (a holder lives),
+        "resumed" (the last holder ended and the model came back, or was loaded anyway), "released" (it ended and
+        the model was not loaded before the first holder's suspend: left as it is), or "waiting: <why>" (it ended,
+        but the model cannot resume yet; the file stays, so the next step tries again)."""
+        with self.holds_lock:
+            f = self._holds_file()
+            if not (f and f.exists()):
+                return ""
+            holders, resume = self._read_holds_state()
+            if self.suspends_in_flight or any(self._holder_alive(h) for h in holders):
+                return "held"
+            if not resume or not (self.hibernated() or self.released()):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+                return "resumed" if resume else "released"
+        # the resume runs outside the lock (it takes the fifo, which a request holds while it checks held_by).  A job
+        # that adds its hold meanwhile is safe: ensure_loaded refuses while any holder lives
+        try:
+            with self.fifo:
+                # again, now that nothing else can change the model: a deliberate hibernate meanwhile dropped the file
+                f = self._holds_file()
+                if not (f and f.exists()) or not self._read_holds_state()[1]:
+                    return ""
+                self.ensure_loaded(resume=True)
+        except (GpuBusy, RuntimeError, OSError) as e:
+            return f"waiting: {e}"
+        self.last_request_at = time.time()               # just back: the idle stages count from now, not the job's start
+        with self.holds_lock:
+            f = self._holds_file()
+            if f and f.exists() and not any(self._holder_alive(h) for h in self._read_holds()):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        print("[strata] the job that held the model has ended: resumed", flush=True)
+        return "resumed"
+
+    def start_hold_watch(self, every_s: float = 5.0):
+        def loop():
+            last = ""
+            while True:
+                time.sleep(every_s)
+                try:
+                    r = self.check_holds()
+                except Exception as e:  # noqa: BLE001 - the watcher must keep running
+                    r = f"waiting: {e}"
+                if r.startswith("waiting") and r != last:
+                    print(f"[strata] hold: the holders ended, the resume {r}", flush=True)
+                last = r
+        threading.Thread(target=loop, daemon=True, name="hold-watch").start()
+
+    DISK_LATCH = "mode disk"                         # local: the latch of a hibernate through the disk tier
+
+    def _hibernate_on_disk(self) -> bool:
+        """Local: the latch was written by a hibernate through the disk tier (its conversations are the engine's
+        --conversation-disk-dir files, taken in by a plain start), not by the engine's HIBERNATE."""
+        try:
+            return self._hibernate_manifest().read_text(encoding="utf-8").splitlines()[:1] == [self.DISK_LATCH]
+        except (OSError, AttributeError, ValueError):
+            return False
+
+    def _write_disk_latch(self) -> None:
+        m = self._hibernate_manifest()
+        m.parent.mkdir(parents=True, exist_ok=True)
+        tmp = m.with_name(m.name + ".tmp")
+        tmp.write_text(self.DISK_LATCH + "\n", encoding="utf-8")
+        tmp.replace(m)
+
+    # ---- resuming only into free memory: what the engine gave back at its hibernate must be free again first
+
+    RESUME_NEEDS = "resume-needs.json"   # beside the manifest (the engine removes only its hib-*.strs names)
+    RESUME_SETTLE_S = 1.0                # an ended process's memory takes a moment to show as free
+    RESUME_VRAM_SLACK_MIB = 512          # the desktop's own use drifts by this much
+    RESUME_RETRY_S = 30
+
+    def _available_ram_mib(self) -> int | None:
+        try:
+            import psutil
+            return int(psutil.virtual_memory().available >> 20)
+        except Exception:
+            return None
+
+    def _free_resources(self) -> dict:
+        return {"ram_mib": self._available_ram_mib(), "vram_mib": self.free_vram_mib()}
+
+    def _record_resume_needs(self, before: dict, hibernated: bool = True) -> None:
+        """After an unload: the RAM and VRAM the engine gave back (free after its exit less free before), kept in
+        memory and beside the hibernate manifest (when there is a folder) so a resume or a reload - also by a server
+        started later - first checks that much is free again."""
+        time.sleep(self.RESUME_SETTLE_S)
+        after = self._free_resources()
+        needs = {k: max(0, after[k] - before[k]) for k in ("ram_mib", "vram_mib")
+                 if before.get(k) is not None and after.get(k) is not None}
+        self._needs = needs or None
+        if self.hibernate_dir:
+            path = Path(self.hibernate_dir) / self.RESUME_NEEDS
+            try:
+                if needs:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps(needs), encoding="utf-8")
+                elif path.exists():                     # nothing measured now: an older record must not stand in
+                    path.unlink()
+            except OSError as e:
+                print(f"[strata] could not record what a reload needs ({e})", flush=True)
+        if needs and (hibernated or self.memory_check_on_load):
+            print("[strata] the engine gave back " + ", ".join(f"{v} MiB of {k[:-4].upper()}" for k, v in needs.items()) +
+                  f" - a {'resume' if hibernated else 'reload'} waits until that is free again", flush=True)
+
+    def resume_needs(self) -> dict | None:
+        """The RAM and VRAM (MiB) the last unload gave back, or None when it was not measured: this server's record,
+        else the hibernate folder's (a server started later)."""
+        if self._needs:
+            return dict(self._needs)
+        if not self.hibernate_dir:
+            return None
+        try:
+            raw = json.loads((Path(self.hibernate_dir) / self.RESUME_NEEDS).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        needs = {k: v for k, v in raw.items() if k in ("ram_mib", "vram_mib") and isinstance(v, int)
+                 and not isinstance(v, bool) and v >= 0}
+        return needs or None
+
+    def resume_status(self) -> dict:
+        """For /health while hibernated (or unloaded, with "memory_check_on_load"): what a resume needs and what keeps
+        it from fitting now (None: it fits)."""
+        if not self.hibernated() and not (self.memory_check_on_load and getattr(self.engine, "unloaded", False)):
+            return {}
+        return {"resume_needs": self.resume_needs(), "resume_blocked": self.resume_blocked(),
+                "resume_on_request": self.resume_on_request}
+
+    def resume_blocked(self) -> str | None:
+        """Why a resume would not fit now, or None (it fits, or nothing was measured)."""
+        needs = self.resume_needs()
+        if not needs:
+            return None
+        short = []
+        if "ram_mib" in needs:
+            have, want = self._available_ram_mib(), needs["ram_mib"] + self.resume_margin_mib
+            if have is not None and have < want:
+                short.append(f"{have} MiB of RAM available, it needs {want} ({needs['ram_mib']} that its hibernate "
+                             f"gave back + {self.resume_margin_mib} resume_margin_mib)")
+        if "vram_mib" in needs:
+            have, want = self.free_vram_mib(), needs["vram_mib"] - self.RESUME_VRAM_SLACK_MIB
+            if have is not None and have < want:
+                short.append(f"{have} MiB of VRAM free, it needs {want}")
+        return "; ".join(short) or None
+
+    def _wait_resumable(self, wait_s: float) -> str | None:
+        """resume_blocked(), polled for up to wait_s seconds while something else may be giving memory back."""
+        deadline = time.time() + max(0.0, wait_s)
+        blocked = self.resume_blocked()
+        while blocked and time.time() < deadline:
+            time.sleep(1.0)
+            blocked = self.resume_blocked()
+        return blocked
+
+    def discard_hibernate(self) -> str | None:
+        """POST /load {"fresh": true}: move the manifest to hibernate.txt.discarded (an older one is replaced; the
+        files it names go with the next hibernate).  The reason when it cannot be moved: then nothing may be loaded,
+        or the conversations the caller wanted gone would be restored."""
+        if not self.hibernated():
+            return None
+        m = self._hibernate_manifest()
+        try:
+            m.replace(m.with_name(m.name + ".discarded"))
+        except OSError as e:
+            return f"the hibernate manifest could not be discarded ({e}); nothing was loaded"
+        print("[strata] hibernate: discarded; starting clean", flush=True)
+        return None
+
+    def _hibernate_aside(self, suffix: str) -> Path | None:
+        """Move the manifest to hibernate.txt<suffix> (replacing an older one): the latch ends, the files stay on disk
+        for a look later (the next hibernate removes them).  None (and a log line) when it cannot be moved."""
+        m = self._hibernate_manifest()
+        aside = m.with_name(m.name + suffix)
+        try:
+            m.replace(aside)
+            return aside
+        except OSError as e:
+            print(f"[strata] hibernate: could not move {m} to {aside.name} ({e})", flush=True)
+            return None
+
+    def _hibernate_spent(self) -> None:
+        """Every conversation came back: delete the manifest and the files it names (entry names only)."""
+        m = self._hibernate_manifest()
+        try:
+            names = [ln[5:].strip() for ln in m.read_text(encoding="utf-8").splitlines() if ln.startswith("file ")]
+        except OSError:
+            names = []
+        try:
+            m.unlink()
+        except OSError:
+            self._hibernate_aside(".restored")
+            return
+        for n in names:
+            if re.fullmatch(r"hib-\d{1,20}-\d{1,20}\.strs", n):
+                try:
+                    (m.parent / n).unlink()
+                except OSError:
+                    pass
+
+    def _settle_hibernate(self) -> None:
+        """After a start with --hibernate-dir: act on the engine's `HIBERNATE restored=N of=M bytes=B status=S`.
+        ok: the folder is spent.  partial / foreign / corrupt: settled - the manifest is set aside (.partial /
+        .refused) and the model runs with what came back.  memory / off / io: the same folder may restore later (more
+        free RAM, the cache on again), so the manifest - and the latch - stay, and the engine is unloaded again (503)."""
+        info = getattr(self.engine, "info", {}) or {}
+        n, of, status = info.get("hibernate_restored"), info.get("hibernate_of"), info.get("hibernate_status")
+        d = self.hibernate_dir
+        if n is None:
+            print(f"[strata] hibernate: the engine did not report a restore; {d} is kept", flush=True)
+            return
+        status = status or ("ok" if n else "memory")
+        counted = f"{n}" + (f" of {of}" if of is not None else "")
+        if status == "ok":
+            print(f"[strata] hibernate: {counted} conversation(s) re-parked from {d}", flush=True)
+            self._hibernate_spent()
+        elif status == "partial":
+            aside = self._hibernate_aside(".partial")
+            print(f"[strata] hibernate: {counted} conversation(s) re-parked (the rest did not fit or were refused; see "
+                  f"the engine log){f'; the manifest is kept as {aside.name}' if aside else ''}", flush=True)
+        elif status in ("foreign", "corrupt"):
+            aside = self._hibernate_aside(".refused")
+            print(f"[strata] hibernate: {d} was refused ({status}: another model, engine build or configuration, or "
+                  f"damaged - see the engine log); starting with an empty conversation cache"
+                  f"{f'; the manifest is kept as {aside.name}' if aside else ''}", flush=True)
+        else:                                           # memory, off, io: worth trying again later
+            print(f"[strata] hibernate: {d} was not restored ({status}); the hibernation is kept", flush=True)
+            self.engine.unload()
+            if self.vision is not None and hasattr(self.vision, "unload"):
+                self.vision.unload()
+            why = {"memory": "not enough free RAM (or conversation-cache budget) for the saved conversations",
+                   "off": "the conversation cache is off (or --batch / a layer split is on) in this configuration",
+                   "io": "the files could not be read"}.get(status, status)
+            raise GpuBusy(f"the saved conversations were not restored: {why}. The model stays hibernated - free RAM "
+                          f"(or fix the configuration) and POST /load again, or /load {{\"fresh\": true}} to start "
+                          f"without them")
+
+    def _restart_without_hibernate(self, error: Exception) -> None:
+        """The engine did not start with --hibernate-dir: set the manifest aside (.unrestorable) and start once more
+        without it.  When that start fails too, the folder was not the cause: the manifest goes back (latch stays)."""
+        aside = self._hibernate_aside(".unrestorable")
+        if aside is None:
+            raise error
+        print(f"[strata] hibernate: the engine did not start with {self.hibernate_dir}; its manifest is kept as "
+              f"{aside.name} and the engine starts without it", flush=True)
+        self.engine.set_hibernate_arg(None)
+        try:
+            self.engine.restart()
+        except RuntimeError:
+            try:
+                aside.replace(self._hibernate_manifest())
+            except OSError:
+                pass
+            raise
 
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
@@ -3313,12 +3946,40 @@ class Service:
         except Exception:
             return None
 
-    def ensure_loaded(self):
+    def ensure_loaded(self, resume: bool = False, force: bool = False):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
-        the free-VRAM check.  The caller holds self.fifo."""
+        the free-VRAM check.  The caller holds self.fifo.  resume=True (an explicit POST /load) also re-parks a
+        hibernated folder; without it a hibernated model refuses to load (503) - unless "resume_on_request".  A
+        hibernated model resumes only once the RAM and VRAM its hibernate gave back are free again (resume_blocked;
+        force=True, POST /load {"force": true}, skips that check)."""
         if self.loaded() and not self._vision_down():
             return
+        held = [] if force else self.held_by()       # local: a running job holds it suspended (see add_holds)
+        if held:
+            who = "its holds file cannot be read" if held == [0] else f"pid {', '.join(map(str, held))}"
+            raise GpuBusy(f"Strata is suspended for a running job ({who}); it resumes by "
+                          f"itself when the job ends. POST /load {{\"force\": true}} resumes it anyway",
+                          retry_after=self.HOLD_RETRY_S)
         hook_failed = None
+        by_request = False
+        if self.hibernated() and not resume:
+            if not self.resume_on_request:
+                raise GpuBusy(f"the model is hibernating (its conversations are saved in {self.hibernate_dir}): POST "
+                              "/load to resume them, or /load {\"fresh\": true} to start clean")
+            resume = by_request = True
+        if self.hibernated() and not force:
+            blocked = self._wait_resumable(self.resume_wait_s if by_request else 0.0)
+            if blocked:
+                raise GpuBusy(f"the model is hibernating and stays so until its memory is free: {blocked}. It resumes "
+                              f"once that is free{' (the next request)' if by_request else ''}; POST /load "
+                              "{\"force\": true} resumes it anyway", retry_after=self.RESUME_RETRY_S)
+        elif not force and self.memory_check_on_load and getattr(self.engine, "unloaded", False):
+            blocked = self._wait_resumable(0.0 if resume else self.resume_wait_s)
+            if blocked:
+                raise GpuBusy(f"the model is unloaded and stays so until its memory is free: {blocked}. It loads once "
+                              "that is free; POST /load {\"force\": true} loads it anyway", retry_after=self.RESUME_RETRY_S)
+            if by_request:
+                print("[strata] hibernate: a request resumes the model (the RAM and VRAM it needs are free)", flush=True)
         if self.before_load:
             cmd = self.before_load
             print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
@@ -3350,7 +4011,8 @@ class Service:
                           flush=True)
                 else:
                     print(f"[strata] the before_load command failed ({why}); checking the free VRAM", flush=True)
-        if self.min_free_vram_mib and not (hook_failed and self.before_load_ignore_failure):
+        if (self.min_free_vram_mib and not (hook_failed and self.before_load_ignore_failure)
+                and not self.released()):   # a released engine still holds its VRAM
             free = self.free_vram_mib()
             deadline = time.time() + self.vram_free_wait_s   # memory another process just gave back can take a moment
             while free is not None and free < self.min_free_vram_mib and time.time() < deadline:
@@ -3377,14 +4039,48 @@ class Service:
             vision_started = True
         if self.loaded():
             return
+        if self.released():                             # partial hibernate: the engine takes its RAM again
+            info = getattr(self.engine, "info", None)
+            print("[strata] partial hibernate: resuming (the experts are read again) ...", flush=True)
+            try:
+                r = self.engine.acquire(str(self.hibernate_dir))
+            except (EngineDied, EngineStuck) as e:      # it could not: the engine ended, a full start follows
+                print(f"[strata] partial hibernate: the engine could not take its RAM again ({e}); starting it again",
+                      flush=True)
+            else:
+                if isinstance(info, dict):
+                    for k in ("restored", "of", "bytes", "status"):
+                        info["hibernate_" + k] = r.get(k)
+                print(f"[strata] partial hibernate: resumed in {r['ms'] / 1000:.1f} s", flush=True)
+                self._settle_hibernate()
+                return
         if getattr(self.engine, "unloaded", False):
             print("[strata] loading the model again (it was unloaded) ...", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[strata] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
+        can_hibernate = hasattr(self.engine, "set_hibernate_arg") and hasattr(self.engine, "spawn")
+        restoring = can_hibernate and self.hibernated()
+        from_disk = restoring and self._hibernate_on_disk()   # local: a plain start takes the disk tier's files in
+        if from_disk:
+            restoring = False
+        if can_hibernate:
+            self.engine.set_hibernate_arg(self.hibernate_dir if restoring else None)
+        info = getattr(self.engine, "info", None)
+        if isinstance(info, dict):                      # an earlier start's restore report must not settle this one
+            for k in [k for k in info if k.startswith("hibernate_")]:
+                del info[k]
         try:
-            self.engine.restart()
+            try:
+                self.engine.restart()
+            except EngineStuck:
+                raise
+            except RuntimeError as e:
+                if not restoring:
+                    raise
+                self._restart_without_hibernate(e)
+                restoring = False
         except Exception:
             if vision_started:
                 self.vision.unload()
@@ -3392,6 +4088,12 @@ class Service:
         print("[strata] the engine is running again", flush=True)
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
             images_api.restore_session(self)
+        if restoring:
+            self._settle_hibernate()
+        elif from_disk:
+            print("[strata] hibernate: resumed; each conversation comes back from the disk when a request continues it",
+                  flush=True)
+            self._hibernate_spent()
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
@@ -3438,8 +4140,10 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self):
-        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
+    def load(self, resume: bool = False, force: bool = False):
+        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy).
+        resume=True only from an explicit /load: it re-parks a hibernated folder (GpuBusy while hibernated, unless
+        "resume_on_request"); force=True skips the free-memory check of a resume."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
@@ -3459,9 +4163,15 @@ class Service:
                     with self.status_lock:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
+                if not self.loaded() or self.released():   # local: the Monitor says the engine is coming up
+                    self.this_request_is("loading the model")
+                    with self.status_lock:
+                        self.status["loading"] = "resuming" if (self.hibernated() or self.released()) else "loading"
                 try:
-                    self.ensure_loaded()
+                    self.ensure_loaded(resume=resume, force=force)
                 finally:
+                    with self.status_lock:
+                        self.status.pop("loading", None)
                     if trace is not None:
                         with self.status_lock:
                             trace["load_s"] += round(time.perf_counter() - loading, 3)
@@ -3473,24 +4183,44 @@ class Service:
 
     UNLOAD_WAIT_S = 300.0       # #1997: POST /unload?wait=1 waits this long for the running turn (wait=<s> to choose)
 
-    def unload_waiting(self, wait_s: float) -> str:
+    def unload_waiting(self, wait_s: float, save: bool = False, keep_gpu: bool = False, own_holds=()) -> str:
         """#1997: unload(), but a running or queued request is waited for (up to wait_s) instead of answering "busy":
         a peer server that needs this GPU can then free the card on the server's terms.  "busy" after wait_s."""
         deadline = time.monotonic() + max(0.0, wait_s)
         while True:
-            r = self.unload()
+            r = self.unload(save=save, keep_gpu=keep_gpu, own_holds=own_holds)
             if r != "busy" or time.monotonic() >= deadline:
                 return r
             time.sleep(0.25)
 
-    def unload(self, idle_for: float | None = None) -> str:
+    def unload(self, idle_for: float | None = None, save: bool = False, keep_gpu: bool = False,
+               own_holds=()) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
-        with idle_for: one ran more recently than that) or "unsupported"."""
+        with idle_for: one ran more recently than that), "held" (local: a full suspend while another job holds a RAM-only
+        one - it would take that job's RAM back) or "unsupported".  save=True first hibernates: the engine
+        writes every parked conversation to the hibernate folder (HIBERNATE), which latches the model unloaded until
+        POST /load; "hibernate failed: ..." when that step fails (the engine is left running, nothing was saved)."""
         if not hasattr(self.engine, "unload"):
             return "unsupported"
+        if save and not self.hibernate_dir:
+            return "hibernate failed: no \"hibernate_dir\" in the run config"
+        if save and not hasattr(self.engine, "hibernate"):
+            return "hibernate failed: this engine cannot hibernate"
+        if save and keep_gpu and not hasattr(self.engine, "release"):
+            return "hibernate failed: this engine cannot give its RAM back alone (keep_gpu)"
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
+            # decided under the fifo, so a second suspend cannot slip between the check and the step (several jobs)
+            if save and keep_gpu and self.released():
+                return "unloaded"                       # already
+            if save and not keep_gpu and self.released():  # partial -> full: take the RAM back, then hibernate it all
+                if [p for p in self.held_by() if p not in set(own_holds)]:
+                    return "held"                       # local: another job runs in that RAM: it waits for it to end
+                try:
+                    self.ensure_loaded(resume=True, force=True)
+                except (GpuBusy, RuntimeError) as e:
+                    return f"hibernate failed: {e}"
             if not self.engine.alive():
                 return "not loaded"
             with self.status_lock:
@@ -3498,28 +4228,105 @@ class Service:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
+            before = self._free_resources()              # what the engine gives back is measured against this
+            was_released = self.released()               # its RAM is already back: this unload frees only VRAM
+            if save and keep_gpu:                       # partial: the engine stays up with its VRAM
+                try:
+                    out = self.engine.release(str(self.hibernate_dir))
+                except SessionRefused as e:
+                    return f"hibernate failed: {e}"
+                except (EngineDied, EngineStuck) as e:
+                    return f"hibernate failed: {e}"
+                self.last_hibernate = out
+                self._record_resume_needs(before, hibernated=True)
+                print(f"[strata] partial hibernate: {out.get('saved')} parked conversation(s) saved to "
+                      f"{self.hibernate_dir}, {(out.get('freed') or 0) >> 20} MiB of RAM given back; the GPU keeps the "
+                      f"weights, its expert cache and the current conversation; "
+                      f"{'the next request resumes it' if self.resume_on_request else 'POST /load to resume'}",
+                      flush=True)
+                return "unloaded"
+            if save and self.disk_persist:
+                # local: QUIT writes the current conversation and the parked ones not on the disk yet (the evicted ones
+                # are there already); the latch then holds the model unloaded as for HIBERNATE
+                t0 = time.time()
+                self.engine.unload()
+                try:
+                    self._write_disk_latch()
+                except OSError as e:
+                    print(f"[strata] hibernate: the conversations are on the disk, but the latch could not be written "
+                          f"({e}); the next request starts the model", flush=True)
+                self.last_hibernate = {"mode": "disk", "ms": int((time.time() - t0) * 1000)}
+                print(f"[strata] hibernate: the engine wrote its conversations to its disk tier in "
+                      f"{time.time() - t0:.1f} s (only what was not there yet)", flush=True)
+            elif save:
+                try:
+                    out = self.engine.hibernate(str(self.hibernate_dir))
+                    self.last_hibernate = out
+                    print(f"[strata] hibernate: {out.get('saved')} conversation(s), {out.get('bytes')} bytes saved to "
+                          f"{self.hibernate_dir} in {out.get('ms', 0) / 1000:.1f} s", flush=True)
+                    if out.get("live") == 0:
+                        print("[strata] hibernate: the current conversation was NOT saved (its save was refused - see "
+                              "the engine log); it is read again from the start after resuming", flush=True)
+                except SessionRefused as e:             # the engine refused or failed it and is still in step
+                    return f"hibernate failed: {e}"
+                except (EngineDied, EngineStuck) as e:  # ended (out of step, silent, or by itself)
+                    if not self.hibernated():           # the manifest is written last: without it, nothing saved
+                        return f"hibernate failed: {e}"
+                    print(f"[strata] hibernate: {e}; the manifest was written before the engine ended: kept",
+                          flush=True)
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
-            print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
-                  "the next request loads it again", flush=True)
+            if (save or self.memory_check_on_load) and not was_released:   # else nothing reads it (or it would be low)
+                self._record_resume_needs(before, hibernated=save)
+            if save:
+                print(f"[strata] model hibernated to {self.hibernate_dir}; "
+                      f"{'the next request resumes it' if self.resume_on_request else 'POST /load to resume'}",
+                      flush=True)
+            else:
+                print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
+                      "the next request loads it again", flush=True)
             return "unloaded"
         finally:
             self.fifo.release()
 
+    def idle_step(self) -> str:
+        """One turn of the idle loop.  Local "idle_release_s": after that long without requests the engine gives its
+        RAM back and keeps the GPU (as /unload {"save": true, "keep_gpu": true}; a request resumes it in seconds).
+        "idle_unload_s": after that long it unloads altogether (with --conversation-disk-persist the engine writes
+        its conversations first).  -> what was done: "released", "unloaded" or ""."""
+        if (self.idle_release_s and self.hibernate_dir and hasattr(self.engine, "release") and self.loaded()
+                and not self.released() and not self.hibernated()):
+            r = self.unload(idle_for=self.idle_release_s, save=True, keep_gpu=True)
+            if r == "unloaded":
+                print(f"[strata] idle {self.idle_release_s:.0f} s: RAM given back (the GPU keeps the model; the next "
+                      "request resumes it)", flush=True)
+                return "released"
+        if self.idle_unload_s and (self.loaded() or self.released()):
+            if self.unload(idle_for=self.idle_unload_s) == "unloaded":
+                return "unloaded"
+        return ""
+
     def start_idle_unload(self):
-        if not self.idle_unload_s or not hasattr(self.engine, "unload"):
+        if not (self.idle_unload_s or self.idle_release_s) or not hasattr(self.engine, "unload"):
             return
-        print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
+        if self.idle_release_s:
+            print(f"[strata] the model gives its RAM back after {self.idle_release_s:.0f} s without requests "
+                  f"(keeps the GPU)", flush=True)
+        if self.idle_unload_s:
+            print(f"[strata] the model unloads after {self.idle_unload_s:.0f} s without requests", flush=True)
+        tick = max(1.0, min(30.0, min(x for x in (self.idle_unload_s, self.idle_release_s) if x) / 4))
 
         def loop():
             while True:
-                time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
+                time.sleep(tick)
                 try:
-                    self.unload(idle_for=self.idle_unload_s)
+                    self.idle_step()
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
+                except Exception as e:  # noqa: BLE001 - the idle thread must keep running
+                    print(f"[strata] idle step: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -3658,8 +4465,12 @@ class Service:
             state = "reading"
         elif s.get("busy"):
             state = "generating"
+        elif s.get("loading"):                          # local: a request is starting or resuming the engine
+            state = s["loading"]
+        elif self.released():                           # local: RAM given back, the GPU keeps the model
+            state = "suspended"
         elif not self.loaded():
-            state = "unloaded"
+            state = "hibernated" if self.hibernated() else "unloaded"
         else:
             state = "idle"
         live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
@@ -3670,7 +4481,11 @@ class Service:
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
-                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
+                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None,
+                "held_by": self.held_by() if state in ("suspended", "hibernated", "unloaded") else None}
+        if live["held_by"]:
+            live["holders"] = self.holders()
+        live["requests"] = self.requests_now()             # local: who is in Strata now, and for what
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         par = int(getattr(self.engine, "batch", 0) or 0)
@@ -3743,7 +4558,7 @@ class Service:
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,
-            "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"), "hibernated": self.hibernated(),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -4146,6 +4961,8 @@ class Service:
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
+            if getattr(self.engine, "batch", 0):
+                self.this_request_is("generating")              # local: the request list
             if not getattr(self.engine, "batch", 0):
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
@@ -4156,6 +4973,7 @@ class Service:
                         got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
                         if got:
                             turn.callback(self.fifo.release)
+                            self.this_request_is("generating")      # local: the request list
                         elif cancel.is_set():
                             break
                         else:
@@ -4415,6 +5233,13 @@ class Service:
                             finish = "stop"
                             break
                         prompt = prompt + seg + extra
+                    if thinking and finish == "stop" and not answered and not cancel.is_set():
+                        # local diagnostic: a reply that thought and then ended with no text and no call - which of
+                        # the two ends it was (parser "reasoning" with nothing held: #1053's case, reasoning_close_retry
+                        # continues it; held "</think>": #537's case, left as it is)
+                        print(f"[strata] empty answer: the reply ended after its thinking with no text or call "
+                              f"(parser={parser.state}, held={parser.buf!r}, "
+                              f"tail={self.tok.decode(raw_ids[-12:])!r})", flush=True)
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:
@@ -4967,6 +5792,29 @@ def anthropic_collect(events) -> dict:
     return msg
 
 
+# ------------------------------------------------------------------------------------------------ documents
+CONVERT_EXT = (".pdf", ".docx", ".xlsx", ".pptx")
+MAX_CONVERT_BYTES = 50 * 1024 * 1024                  # the file itself; its base64 in the request is 4/3 of that
+
+
+def convert_document(name: str, data: bytes) -> str:
+    """The text of a PDF / Word / Excel / PowerPoint file as Markdown, for the web app's attach button.  MarkItDown is
+    optional (pip install "markitdown[pdf,docx,xlsx,pptx]"): RuntimeError without it, ValueError for another type.
+    A scanned PDF has no text layer and gives (almost) nothing - there is no OCR here."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in CONVERT_EXT:
+        raise ValueError(f"{name}: only {', '.join(CONVERT_EXT)} files are converted")
+    try:
+        from markitdown import MarkItDown, StreamInfo
+    except ImportError:
+        raise RuntimeError('reading documents needs MarkItDown: .venv\\Scripts\\python -m pip install '
+                           '"markitdown[pdf,docx,xlsx,pptx]", then restart Strata') from None
+    import io
+    result = MarkItDown(enable_plugins=False).convert_stream(io.BytesIO(data),
+                                                              stream_info=StreamInfo(extension=ext, filename=name))
+    return result.markdown
+
+
 # ------------------------------------------------------------------------------------------------ HTTP
 CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding: chunked body may hold (read into memory)
 
@@ -5338,7 +6186,11 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "hibernated": svc.hibernated(), "released": svc.released(),
+                                 **svc.resume_status(),
+                                 **({"held_by": h, "holders": svc.holders()} if (h := svc.held_by()) else {}),
+                                 **({"requests": r} if (r := svc.requests_now()) else {}),
+                                 "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -5430,32 +6282,169 @@ def make_handler(svc: Service):
             if path == "/config":
                 self._config_post()
                 return
-            if path in ("/unload", "/load") and not self._control_body():
+            if path == "/convert":
+                self._convert()
                 return
+            control = {}
+            if path in ("/unload", "/load", "/hold"):
+                raw = self._control_body()
+                if raw is None:
+                    return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
-            if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
+            if path in ("/unload", "/load", "/hold") and not self._own_page("the model can be loaded or unloaded"):
                 return
+            if path in ("/unload", "/load", "/hold") and raw.strip():
+                try:
+                    control = json.loads(raw)
+                except ValueError:
+                    control = None
+                if not isinstance(control, dict):
+                    self._json(400, {"error": {"message": "send a JSON object"}})
+                    return
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
+                return
+            hold_pids = control.get("hold_pids") if path in ("/unload", "/hold") else None
+            if hold_pids is not None and not (isinstance(hold_pids, list) and hold_pids and
+                                              all(isinstance(x, int) and not isinstance(x, bool) for x in hold_pids)):
+                self._json(400, {"error": {"message": "hold_pids: a list of process ids"}})
+                return
+            if hold_pids and not svc.hibernate_dir:
+                self._json(400, {"error": {"message": "a hold needs \"hibernate_dir\" in the run config"}})
+                return
+            if hold_pids:                                    # local: every holder must be running, before anything
+                import psutil
+                missing = [x for x in hold_pids if not psutil.pid_exists(x)]
+                if missing:
+                    self._json(400, {"error": {"message": f"hold_pids: no such process {missing}"}})
+                    return
+            if path == "/hold":                              # local: add holders, or {"release": true}
+                if control.get("release") is True:
+                    svc.release_holds()
+                    self._json(200, {"status": "released"})
+                    return
+                if "stop" in control:                        # local: the user ends wrapped jobs that hold it
+                    what = control.get("stop")
+                    if not (what == "all" or (isinstance(what, list) and what and
+                                              all(isinstance(x, int) and not isinstance(x, bool) for x in what))):
+                        self._json(400, {"error": {"message": "stop: \"all\" or a list of process ids"}})
+                        return
+                    sys.path.insert(0, str(ROOT / "tools"))
+                    import strata_jobs
+                    done = strata_jobs.stop_jobs(None if what == "all" else what, svc.held_by())
+                    for h in done:
+                        h["advice"] = strata_jobs.advice(h)
+                    for _ in range(20):                      # the ended processes leave the holders
+                        if not set(svc.held_by()) & {p for h in done if h.get("stopped") for p in h["pids"]}:
+                            break
+                        time.sleep(0.25)
+                    svc.check_holds_quietly()
+                    svc._holders_cache = None
+                    print(f"[strata] stop: {sum(1 for h in done if h.get('stopped'))} wrapped job(s) ended by the user",
+                          flush=True)
+                    self._json(200, {"status": "stopped", "stopped": done, "held_by": svc.held_by()})
+                    return
+                if "release_pids" in control:                # local: a job's wrapper: only its own holders are done
+                    done = control.get("release_pids")
+                    if not (isinstance(done, list) and done and
+                            all(isinstance(x, int) and not isinstance(x, bool) for x in done)):
+                        self._json(400, {"error": {"message": "release_pids: a list of process ids"}})
+                        return
+                    try:
+                        left = svc.release_holds(done)
+                        r = svc.check_holds() if not left else "held"   # the last one out resumes it (if loaded)
+                    except OSError as e:
+                        self._json(503, {"error": {"message": f"the holds file: {e}; the watcher retries"}})
+                        return
+                    self._json(200, {"status": "released", "held_by": left, "resumed": r == "resumed",
+                                     **({"waiting": r[len("waiting: "):]} if r.startswith("waiting") else {})})
+                    return
+                if not hold_pids:
+                    self._json(400, {"error": {"message": "send {\"hold_pids\": [pid, ...]} or {\"release\": true}"}})
+                    return
+                try:
+                    self._json(200, {"status": "held", "held_by": svc.add_holds(hold_pids, resume=False)})
+                except (ValueError, OSError) as e:
+                    self._json(400, {"error": {"message": str(e)}})
                 return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
                     wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
                                          svc.UNLOAD_WAIT_S)
-                    r = svc.unload_waiting(wait_s) if wait_s else svc.unload()
+                    save, keep_gpu = control.get("save") is True, control.get("keep_gpu") is True
                 except EngineStuck as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                self._json(409 if r == "busy" else 200, {"status": r})
+                held, added, in_flight = [], [], False
+                was_loaded = svc.loaded()                # fully running now (not RAM-only, not off)
+                if hold_pids and save:
+                    # local: the hold goes in BEFORE the engine stops, so no request can resume the model in between.
+                    # Whether the last holder's end resumes the model is set below, once this suspend has stopped it
+                    before = set(svc.held_by())
+                    try:
+                        held = svc.add_holds(hold_pids, resume=False)
+                    except (ValueError, OSError) as e:   # the holder ended meanwhile: refused, nothing stopped
+                        self._json(400, {"error": {"message": f"hold_pids: {e}"}})
+                        return
+                    added = [p for p in hold_pids if p not in before]
+                    with svc.holds_lock:                 # the watcher waits: a wrapper killed meanwhile must not end
+                        svc.suspends_in_flight += 1      # the hold before this suspend has set whether to resume
+                    in_flight = True
+                elif save:
+                    svc.drop_ended_holds()               # a deliberate hibernate: no pending resume brings it back
+                try:
+                    try:
+                        r = (svc.unload_waiting(wait_s, save=save, keep_gpu=keep_gpu, own_holds=hold_pids or ())
+                             if wait_s else svc.unload(save=save, keep_gpu=keep_gpu, own_holds=hold_pids or ()))
+                    except EngineStuck as e:
+                        r = f"hibernate failed: {e}"
+                    try:
+                        if held and r not in ("unloaded", "not loaded"):   # not suspended: this request's hold goes
+                            if added:
+                                svc.release_holds(added)
+                        elif held and r == "unloaded" and was_loaded:      # it stopped a running model: back after
+                            svc.set_hold_resume()
+                    except OSError as e:
+                        print(f"[strata] hold: {e}", flush=True)
+                finally:
+                    if in_flight:
+                        with svc.holds_lock:
+                            svc.suspends_in_flight -= 1
+                if held and r not in ("unloaded", "not loaded") and added:
+                    svc.check_holds()
+                if r.startswith("hibernate failed"):
+                    self._json(503, {"error": {"type": "server_error", "message": r}})
+                    return
+                if r == "held":                              # local: wait for the RAM-only job(s) to end, then retry
+                    self._json(409, {"status": "held", "held_by": svc.held_by(),
+                                     "error": {"message": "a job holds a RAM-only suspend: a full one would take its "
+                                                          "RAM back; retry when it has ended"}})
+                    return
+                saved = r == "unloaded" and save
+                partial = saved and keep_gpu
+                live_lost = saved and (svc.last_hibernate or {}).get("live") == 0
+                if not saved:
+                    held = held if r == "not loaded" else []
+                self._json(409 if r == "busy" else 200, {"status": r, **({"hibernated": True} if saved else {}),
+                                                         **({"held_by": svc.held_by()} if held else {}),
+                                                         **({"kept": "gpu"} if partial else {}),
+                                                         **({"live_saved": False} if live_lost else {})})
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
+                if control.get("fresh") is True and svc.hibernate_dir:
+                    err = svc.discard_hibernate()
+                    if err:                                  # loading now would restore what was to be discarded
+                        self._json(500, {"error": {"type": "server_error", "message": err}})
+                        return
                 try:
-                    svc.load()
+                    svc.load(resume=True, force=control.get("force") is True)
                     self._json(200, {"status": "loaded"})
                 except GpuBusy as e:
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
+                except RuntimeError as e:                    # the engine did not start: say so instead of hanging up
+                    self._json(503, {"error": {"type": "server_error", "message": f"the engine did not start: {e}"}})
                 return
             try:
                 req = json.loads(self._body() or b"{}")
@@ -5474,9 +6463,16 @@ def make_handler(svc: Service):
                     if path == "/v1/unload":
                         wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
                                              svc.UNLOAD_WAIT_S)
-                        result = svc.unload_waiting(wait_s) if wait_s else svc.unload()
-                        if result == "busy":
-                            raise ModelBusy("a request is running or queued")
+                        save, keep_gpu = req.get("save") is True, req.get("keep_gpu") is True
+                        if save:
+                            svc.drop_ended_holds()
+                        result = (svc.unload_waiting(wait_s, save=save, keep_gpu=keep_gpu) if wait_s
+                                  else svc.unload(save=save, keep_gpu=keep_gpu))
+                        if result in ("busy", "held"):
+                            raise ModelBusy("a request is running or queued" if result == "busy" else
+                                            "a job holds a RAM-only suspend; retry when it has ended")
+                        if result.startswith("hibernate failed"):
+                            raise GpuBusy(result)
                     else:
                         if not svc.fifo.acquire(blocking=False):
                             raise ModelBusy("a request is running or queued")
@@ -5484,7 +6480,12 @@ def make_handler(svc: Service):
                             with svc.status_lock:
                                 if svc.status.get("busy") or svc.status.get("queued"):
                                     raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded()
+                            if req.get("fresh") is True and svc.hibernate_dir:
+                                err = svc.discard_hibernate()
+                                if err:
+                                    self._json(500, {"error": {"type": "server_error", "message": err}})
+                                    return
+                            svc.ensure_loaded(resume=True, force=req.get("force") is True)
                             svc.last_request_at = time.time()
                         finally:
                             svc.fifo.release()
@@ -5504,8 +6505,8 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     self.record = svc.begin_request(path, req)
-                if path == "/v1/responses":
-                    self._responses(req)
+                    with svc.agent_request(self.headers, path) as self.agent_sid:   # local: who is working
+                        self._chat_route(path, req)
                 elif path.startswith("/slots/"):
                     query = parse_qs(self.path.partition("?")[2])
                     try:
@@ -5515,10 +6516,6 @@ def make_handler(svc: Service):
                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
                                                      "the engine again", "type": "server_error"}}
                     self._json(code, body)
-                elif path == "/v1/chat/completions":
-                    self._openai(req)
-                elif path == "/v1/messages":
-                    self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
                 elif path == "/v1/images/generations":
@@ -5631,32 +6628,34 @@ def make_handler(svc: Service):
                 props["build_info"] = "Strata " + str(version)
             self._json(200, props)
 
-        def _control_body(self) -> bool:
-            """Consume the unused control body before replying/closing (Windows otherwise sends a TCP reset)."""
+        def _control_body(self) -> bytes | None:
+            """Read the control request's body - all of it, so Windows does not send a TCP reset - and return it
+            (/unload {"save": true}, /load {"fresh": true}).  None when it was invalid (a reply was already sent)."""
             if self._chunked():
                 self.body_read = True
                 try:
                     self.connection.settimeout(2.0)
-                    self._read_chunked(65536, keep=False)
+                    return self._read_chunked(65536)
                 except BadBody as e:
                     self._json(e.status, {"error": {"message": f"control request: {e}"}})
-                    return False
+                    return None
                 except OSError:
                     self._json(400, {"error": {"message": "incomplete control request body"}})
-                    return False
-                return True
+                    return None
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 self._json(400, {"error": {"message": "invalid Content-Length"}})
-                return False
+                return None
             if not 0 <= length <= 65536:
                 self._json(413, {"error": {"message": "control request body is limited to 64 KiB"}})
-                return False
+                return None
             timeout = self.connection.gettimeout()
+            raw = b""
             try:
                 self.connection.settimeout(2.0)
-                complete = len(self.rfile.read(length)) == length
+                raw = self.rfile.read(length) if length else b""
+                complete = len(raw) == length
             except OSError:
                 complete = False
             finally:
@@ -5664,7 +6663,8 @@ def make_handler(svc: Service):
                 self.body_read = True                    # nothing left for the drain to wait for (#594)
             if not complete:
                 self._json(400, {"error": {"message": "incomplete control request body"}})
-            return complete
+                return None
+            return raw
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -5756,7 +6756,43 @@ def make_handler(svc: Service):
                   if shared else "[strata] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
+        def _convert(self):
+            # a document attached in the web app -> its text ({"name", "data": base64 or a data: URL} -> {"text"});
+            # only the app's own page may ask, like /settings (it reads what it is sent, nothing on disk)
+            try:
+                size = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._json(400, {"error": {"message": "invalid Content-Length"}})
+                return
+            if size > MAX_CONVERT_BYTES * 4 // 3 + 65536:
+                self._json(413, {"error": {"message": f"the file is over {MAX_CONVERT_BYTES >> 20} MB"}})
+                return
+            body = self.rfile.read(size)
+            if not self._own_page("documents can be read"):
+                return
+            try:
+                req = json.loads(body or b"{}")
+                name = str(req.get("name") or "") if isinstance(req, dict) else ""
+                data = base64.b64decode(str(req.get("data") or "").split(",", 1)[-1], validate=True)
+                t0 = time.time()
+                text = convert_document(name, data)
+            except ValueError as e:                          # bad JSON / base64, or a type it does not convert
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            except RuntimeError as e:                        # MarkItDown is not installed
+                self._json(501, {"error": {"type": "server_error", "message": str(e)}})
+                return
+            except Exception as e:                           # a damaged or protected file: MarkItDown's own error
+                self._json(422, {"error": {"type": "invalid_request_error",
+                                           "message": f"could not read it ({type(e).__name__}: {e})"[:500]}})
+                return
+            print(f"[strata] document converted: {len(data):,} bytes -> {len(text):,} characters in "
+                  f"{time.time() - t0:.1f} s", flush=True)
+            self._json(200, {"name": name, "text": text, "chars": len(text)})
+
         def _sse(self):
+            if getattr(self, "sse_started", False):          # local: _wait_for_hold sent the headers already
+                return
             self._note(http_status=200)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -5764,6 +6800,67 @@ def make_handler(svc: Service):
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
             self._cors()
             self.end_headers()
+
+        def _chat_route(self, path, req):
+            if path == "/v1/responses":
+                self._responses(req)
+            elif path == "/v1/chat/completions":
+                self._openai(req)
+            else:
+                self._anthropic(req)
+
+        def _wait_for_hold(self, stream: bool, api: str = "openai") -> str:
+            """Local: a job holds the model suspended (strata_suspend.py run).  Refused with 503, an agent retries a
+            few times and then ends its turn with an error (opencode: about 9 tries), and nothing tells it when the
+            job is done.  So a request waits instead: a stream starts at once and gets a keep-alive every
+            KEEPALIVE_S (an idle timeout counts silence, not the wait) until the last holder ends, then the model is
+            loaded and the request goes on as usual.  A request that is not streamed waits silently.
+            -> "" (no hold, or it waited without a stream: the caller loads as usual), "started" (the stream is
+            started and the model loaded) or "answered" (the client left, or the load failed - said in the stream)."""
+            self.sse_started = False
+            if svc.loaded() or not svc.held_by():
+                return ""
+            held = svc.held_by()
+            print(f"[strata] a request waits for the job that holds the model (pid {', '.join(map(str, held))})",
+                  flush=True)
+            with svc.status_lock:
+                svc.status["held_waiting"] = svc.status.get("held_waiting", 0) + 1
+            svc.agent_state(getattr(self, "agent_sid", None), "waiting out a hold")
+            try:
+                if not stream:
+                    while svc.held_by() and not svc.loaded():
+                        time.sleep(1.0)
+                    svc.check_holds_quietly()                         # the holders ended: resume as the watcher does
+                    return ""
+                self._sse()
+                self.sse_started = True
+                last = 0.0
+                while svc.held_by() and not svc.loaded():
+                    if time.monotonic() - last >= KEEPALIVE_S:
+                        self.wfile.write(b": keep-alive (Strata is held for a running job; this request waits)\n\n")
+                        self.wfile.flush()
+                        last = time.monotonic()
+                    time.sleep(1.0)
+                try:
+                    svc.check_holds_quietly()                         # the holders ended: resume as the watcher does
+                    svc.load()
+                except (GpuBusy, EngineStarting, EngineStuck, EngineDied, RuntimeError) as e:
+                    err = {"type": "server_error", "message": f"the model could not come back after the job: {e}"}
+                    if api == "anthropic":
+                        self.wfile.write(b"event: error\ndata: " + json.dumps({"type": "error", "error": err}).encode()
+                                         + b"\n\n")
+                    else:
+                        self.wfile.write(b"data: " + json.dumps({"error": err}).encode() + b"\n\ndata: [DONE]\n\n")
+                    self.wfile.flush()
+                    return "answered"
+                return "started"
+            except OSError:                                  # the client left while it waited
+                self._note(outcome="disconnected")
+                return "answered"
+            finally:
+                with svc.status_lock:
+                    svc.status["held_waiting"] = max(0, svc.status.get("held_waiting", 1) - 1)
+                svc.agent_state(getattr(self, "agent_sid", None), "generating")
 
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
@@ -5815,7 +6912,11 @@ def make_handler(svc: Service):
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
-            svc.load()
+            waited = self._wait_for_hold(req.get("stream") is True)   # local: a job holds the model - wait for it
+            if waited == "answered":
+                return
+            if not waited:
+                svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
@@ -5905,7 +7006,9 @@ def make_handler(svc: Service):
             except ModelBusy as e:
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
-                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                ra = getattr(e, "retry_after", None)
+                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"),
+                                  headers={"Retry-After": int(ra)} if ra else None)
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
@@ -6010,7 +7113,11 @@ def make_handler(svc: Service):
                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
-            svc.load()
+            waited = self._wait_for_hold(req.get("stream") is True)   # local: a job holds the model - wait for it
+            if waited == "answered":
+                return
+            if not waited:
+                svc.load()
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
@@ -6048,7 +7155,11 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
-            svc.load()
+            waited = self._wait_for_hold(req.get("stream") is True, "anthropic")   # local: a job holds the model
+            if waited == "answered":
+                return
+            if not waited:
+                svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
@@ -6618,6 +7729,97 @@ FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35
 def default_model_name(cfg: dict) -> str:
     """The config's "model_name", else its family's name ("arch": qwen4exp, qwen35moe), else Flash-Next's."""
     return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(cfg.get("arch") or "qwen4exp", "qwen3.8-flash-next")
+HEARTBEAT = ROOT / "data" / "strata-alive.json"
+HEARTBEAT_S = 60.0
+last_beat = None                                     # set by start_heartbeat: write the register now
+
+
+def start_heartbeat(every_s: float = HEARTBEAT_S, register=None) -> float | None:
+    """Local "wake_cut_off_jobs": while Strata runs, data/strata-alive.json says so every minute, with the live
+    register - which agent sessions are working right now (tools/strata_jobs.py live_register).  At the start the
+    previous run's last beat is kept aside (strata-alive.prev.json): when Strata stopped (a crash, a power cut,
+    closed), so `wake` knows whose requests failed because it was down, and who was working when the PC went down.
+    -> that previous beat's time (None the first time)."""
+    prev = None
+    try:
+        prev = float(json.loads(HEARTBEAT.read_text(encoding="utf-8")).get("alive"))
+        HEARTBEAT.replace(HEARTBEAT.with_name("strata-alive.prev.json"))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+
+    def write(**extra):
+        try:
+            live = register() if register else None
+        except Exception as e:  # noqa: BLE001 - the beat itself must go on
+            live = {"time": time.time(), "error": str(e)}
+        if live and extra:
+            live.update(extra)
+        if live and extra.get("shutting_down"):
+            # Windows may have ended an agent's processes before this handler runs: who was working a minute ago
+            # stays in (the last beat's entries, added to what is seen now)
+            try:
+                before = json.loads(HEARTBEAT.read_text(encoding="utf-8")).get("live") or {}
+                for agent in ("opencode", "claude"):
+                    live[agent] = {**(before.get(agent) or {}), **(live.get(agent) or {})}
+            except (OSError, ValueError, AttributeError):
+                pass
+        try:
+            HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
+            tmp = HEARTBEAT.with_name(HEARTBEAT.name + f".{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps({"alive": time.time(), "pid": os.getpid(), **extra,
+                                       **({"live": live} if live else {})}), encoding="utf-8")
+            tmp.replace(HEARTBEAT)
+        except OSError:
+            pass
+
+    def beat():
+        while True:
+            write()
+            time.sleep(every_s)
+
+    global last_beat
+    last_beat = write                                   # the close handler's final entry (see main)
+    threading.Thread(target=beat, daemon=True, name="heartbeat").start()
+    return prev
+
+
+def spawn_job_wake(after_s: float = 15.0, popen=subprocess.Popen, last_alive: float | None = None,
+                   log: Path | None = None):
+    """Local "wake_cut_off_jobs": a few seconds after the start (the hold watcher has settled the old holds by then),
+    `tools/strata_suspend.py wake` sends each opencode session whose wrapped job was cut off - a power cut, a crash,
+    Task Manager - a note through the opencode server (see tools/strata_jobs.py).  In the background: the start does
+    not wait for it; its output goes to data/strata-wake.log (`log`: elsewhere - the tests)."""
+    log = log or ROOT / "data" / "strata-wake.log"
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
+        with open(log, "a", encoding="utf-8") as out:
+            out.write(f"\n# {time.strftime('%Y-%m-%d %H:%M:%S')} Strata started: wake in {after_s:.0f} s\n")
+            out.flush()
+            popen([sys.executable, str(ROOT / "tools" / "strata_suspend.py"), "wake", "--after", str(after_s),
+                   *(["--strata-last-alive", str(last_alive)] if last_alive else [])],
+                  stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=str(ROOT), creationflags=flags,
+                  start_new_session=os.name != "nt", close_fds=True)
+        print(f"[strata] wake_cut_off_jobs: sessions whose wrapped jobs were cut off are told in {after_s:.0f} s "
+              f"(log: {log})", flush=True)
+    except OSError as e:
+        print(f"[strata] wake_cut_off_jobs: could not start ({e})", flush=True)
+
+
+def hibernated_at_start(hibernate_dir, cwd=None) -> bool:
+    """Hibernated when the server stopped (the folder's hibernate.txt is there): start unloaded, so the GPU stays with
+    whatever it was given to until POST /load resumes (or /load {"fresh": true} discards).  A relative folder is the
+    config's cwd's, as hibernate_dir is everywhere else."""
+    if not isinstance(hibernate_dir, str) or not hibernate_dir:
+        return False
+    d = Path(hibernate_dir)
+    if not d.is_absolute() and cwd:
+        d = Path(cwd) / d
+    if not (d / "hibernate.txt").exists():
+        return False
+    print(f"[strata] hibernate: {d} holds saved conversations - the model stays unloaded until POST /load resumes "
+          "them (or /load {\"fresh\": true} discards them)", flush=True)
+    return True
 
 
 def main() -> int:
@@ -6659,6 +7861,9 @@ def main() -> int:
                          "\"min_free_vram_mib\" in the config; default: always load)")
     ap.add_argument("--before-load", help="a command run before the model is loaded again (e.g. to unload another "
                                           "server's model; also \"before_load\" in the config, a string or a list)")
+    ap.add_argument("--hibernate-dir", help="the folder POST /unload {\"save\": true} writes the parked conversations "
+                                            "to and POST /load reads back (also \"hibernate_dir\" in the config; "
+                                            "default: off)")
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
@@ -6704,6 +7909,8 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
+        if not lazy and hibernated_at_start(a.hibernate_dir or cfg.get("hibernate_dir"), cfg.get("cwd")):
+            lazy = True
         if cfg.get("vision"):
             elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
@@ -6747,6 +7954,12 @@ def main() -> int:
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
             raise SystemExit(f"[strata] config {e}")
+        save_on_close = os.name == "nt" and cfg.get("save_on_close") is True and not groups
+        if save_on_close and disk_persist_mode(engine_args(cfg)) == "off":
+            print("[strata] \"save_on_close\" needs --conversation-disk-persist (and --conversation-disk-dir) in the "
+                  "config's args: closing the window would end the engine without saving; off", flush=True)
+            save_on_close = False
+        StrataEngine.detach_console = save_on_close    # before the first start (serve/winclose.py)
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
         else:
@@ -6837,6 +8050,7 @@ def main() -> int:
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
+    svc.idle_release_s = float(cfg.get("idle_release_s") or 0)   # local: needs "hibernate_dir"
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
@@ -6847,6 +8061,12 @@ def main() -> int:
               f"{svc.before_load_timeout_s:g} s", flush=True)
     svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
     svc.before_load_strict = cfg.get("before_load_strict") is True
+    svc.resume_on_request = cfg.get("resume_on_request") is True
+    svc.memory_check_on_load = cfg.get("memory_check_on_load") is True
+    for key, cast in (("resume_margin_mib", int), ("resume_wait_s", float)):
+        v = cfg.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+            setattr(svc, key, cast(v))
     # --slot-save-path is relative to the working directory the server was started in; the config's slot_save_path
     # to the config's "cwd" (the engine's folder) when it has one.  Either way the engine gets an absolute path.
     if a.slot_save_path or cfg.get("slot_save_path"):
@@ -6857,6 +8077,19 @@ def main() -> int:
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    hib = a.hibernate_dir or cfg.get("hibernate_dir")
+    if hib:
+        try:
+            svc.hibernate_dir = slot_save_dir(hib) if a.hibernate_dir else slot_save_dir(hib, cfg.get("cwd"))
+        except (ValueError, OSError) as e:
+            raise SystemExit(f"[strata] hibernate_dir: {e}")
+        print(f'[strata] hibernate: POST /unload {{"save": true}} saves the conversations to {svc.hibernate_dir} and '
+              "latches the model unloaded; POST /load resumes it", flush=True)
+        args_now = engine_args(cfg)
+        if disk_persist_mode(args_now) != "off" and "--conversation-disk-dir" in args_now:
+            svc.disk_persist = True                     # local: a full hibernate goes through the disk tier
+            print("[strata] hibernate: through the persistent disk tier (only what is not on the disk yet is written; "
+                  "a resume restores each conversation when a request continues it)", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -6916,8 +8149,19 @@ def main() -> int:
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
+    if svc.idle_release_s and not svc.hibernate_dir:
+        print("[strata] \"idle_release_s\" needs \"hibernate_dir\" in the config: off", flush=True)
+        svc.idle_release_s = 0
     svc.start_idle_unload()
     svc.start_vision_idle()
+    if svc.hibernate_dir:
+        svc.start_hold_watch()                          # local: resume when the last holding job has ended
+    if cfg.get("wake_cut_off_jobs") is True:            # local: tell the sessions whose wrapped jobs were cut off
+        sys.path.insert(0, str(ROOT / "tools"))
+        import strata_jobs                              # local: the live register (who is working)
+        spawn_job_wake(last_alive=start_heartbeat(
+            register=lambda: strata_jobs.live_register(strata_requests={
+                k: r for k, r in svc.live_requests().items() if r.get("session")})))
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
@@ -6950,6 +8194,30 @@ def main() -> int:
         signal.signal(signal.SIGTERM, on_sigterm)
     except (ValueError, OSError, AttributeError):         # not the main thread
         pass
+    if StrataEngine.detach_console:
+        # local "save_on_close": the window's X, log-off or shutdown give this process ~5 s.  Let the engine outlive
+        # it and close its stdin: the engine, which has no console of its own, treats that as QUIT, writes the current
+        # and the parked conversations to the disk (--conversation-disk-persist) and ends on its own.
+        from serve import winclose, winjob
+
+        def on_close():
+            print("[strata] window closing: the engine writes its conversations to the disk and then ends", flush=True)
+            if last_beat is not None:                    # local: who was working, to the second (Windows ends it soon)
+                try:
+                    last_beat(shutting_down=True)
+                except Exception:  # noqa: BLE001 - the save below matters more
+                    pass
+            winjob.release()
+            proc = getattr(engine, "proc", None)
+            if proc is not None and proc.stdin:
+                try:
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    pass
+
+        if winclose.install(on_close):
+            print("[strata] save_on_close: closing this window or Ctrl+C saves the conversations first "
+                  "(Ctrl+C twice ends at once, without saving)", flush=True)
     try:
         while True:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
