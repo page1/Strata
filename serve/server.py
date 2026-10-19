@@ -3295,12 +3295,20 @@ class Service:
 
     @staticmethod
     def _holder_alive(h: dict) -> bool:
+        """A holder is gone only when its process is: no such process, a zombie, or the pid reused (another start
+        time).  Unknown liveness - access denied, no psutil, any other error - keeps the hold, as an unreadable holds
+        file does: nothing loads the model over a job it cannot see (reviewed on Niko1221/Strata#1937)."""
         try:
             import psutil
+        except ImportError:
+            return True
+        try:
             p = psutil.Process(h["pid"])
             return abs(p.create_time() - float(h.get("started") or 0)) < 1.0 and p.status() != psutil.STATUS_ZOMBIE
-        except Exception:  # noqa: BLE001 - no such process (or no access): not a live holder
+        except psutil.NoSuchProcess:   # gone (psutil's ZombieProcess is one too)
             return False
+        except Exception:  # noqa: BLE001 - access denied and the rest: unknown, so still a holder
+            return True
 
     def held_by(self) -> list[int]:
         """The live holders' pids ([] when nothing holds the model).  A read: no lock (the file is replaced whole).

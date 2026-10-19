@@ -663,5 +663,78 @@ class InterruptedWithRegister(Interrupted):
         self.assertIn("long-before", told)
 
 
+class HoldsAcknowledged(unittest.TestCase):
+    """Reviewed on Niko1221/Strata#1937 (midhatn): unknown liveness keeps a hold; a suspend counts only when the
+    server acknowledges this job's hold; a job whose hold cannot be registered is not left running."""
+
+    def setUp(self):
+        import importlib
+        self.S = importlib.import_module("strata_suspend")
+        sys.path.insert(0, str(HERE.parent))
+        from serve import server
+        self.server = server
+
+    def test_unknown_liveness_keeps_the_hold(self):
+        import psutil
+        alive = self.server.Service._holder_alive
+        with mock.patch("psutil.Process", side_effect=psutil.AccessDenied(123)):
+            self.assertTrue(alive({"pid": 123, "started": 1.0}))       # denied access: still a holder
+        with mock.patch("psutil.Process", side_effect=psutil.NoSuchProcess(123)):
+            self.assertFalse(alive({"pid": 123, "started": 1.0}))      # gone
+        me = psutil.Process()
+        self.assertTrue(alive({"pid": me.pid, "started": me.create_time()}))
+        self.assertFalse(alive({"pid": me.pid, "started": me.create_time() - 100}))   # a reused pid
+        with mock.patch.dict(sys.modules, {"psutil": None}):
+            self.assertTrue(alive({"pid": 123, "started": 1.0}))       # no psutil: unknown, kept
+
+    def test_a_lost_unload_answer_is_asked_again_and_must_list_this_job(self):
+        S, me = self.S, os.getpid()
+        answers = iter([(0, {}),                                          # the answer was lost (a timeout)
+                        (200, {"status": "not loaded", "held_by": [me]})])
+        with mock.patch.object(S, "http", side_effect=lambda *a, **k: next(answers)), \
+                mock.patch.object(S, "hibernated_after_all", return_value=True), mock.patch("time.sleep"), \
+                mock.patch("builtins.print"):
+            self.assertEqual(S.suspend("http://x", None, 30, hold_pids=[me]), 0)
+        # an earlier latch says hibernated, but the server never lists this job as a holder: the job is not started
+        with mock.patch.object(S, "http", return_value=(200, {"status": "not loaded", "held_by": []})), \
+                mock.patch("time.sleep"), mock.patch("builtins.print"):
+            self.assertEqual(S.suspend("http://x", None, 0, hold_pids=[me]), 1)
+
+    def test_hold_reports_unacknowledged_registration(self):
+        S, me = self.S, os.getpid()
+        with mock.patch("time.sleep"), mock.patch("builtins.print"):
+            with mock.patch.object(S, "http", return_value=(200, {"status": "held", "held_by": [me]})):
+                self.assertIs(S.hold("http://x", None, [me]), True)
+            with mock.patch.object(S, "http", return_value=(200, {"status": "held", "held_by": []})):
+                self.assertIs(S.hold("http://x", None, [me]), False)      # 200, but not listed: not acknowledged
+            with mock.patch.object(S, "http", return_value=(503, {"error": {"message": "the holds file: busy"}})):
+                self.assertIs(S.hold("http://x", None, [me]), False)
+            with mock.patch.object(S, "http", return_value=(400, {"error": {"message": "no such process"}})):
+                self.assertIsNone(S.hold("http://x", None, [me]))         # the job ended already
+
+    def test_a_job_whose_hold_is_refused_is_stopped(self):
+        S = self.S
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        argv = ["strata_suspend.py", "run", "--port", "1", "--", PY, "-c", "import time; time.sleep(60)"]
+        started = []
+        real_start = S.start_job
+
+        def start(cmd, rec):
+            proc, log = real_start(cmd, rec)
+            started.append(proc)
+            return proc, log
+        with mock.patch.object(J, "JOBS_DIR", Path(tmp.name)), mock.patch.dict(os.environ, {"STRATA_SUSPEND_JOBS_DIR": tmp.name}), \
+                mock.patch.object(S, "http", return_value=(200, {"status": "ok"})), \
+                mock.patch.object(S, "suspend", return_value=0), mock.patch.object(S, "hold", return_value=False), \
+                mock.patch.object(S, "release_own"), mock.patch.object(S, "start_job", side_effect=start), \
+                mock.patch.object(sys, "argv", argv), mock.patch("builtins.print"):
+            t0 = time.time()
+            code = S.main()
+        self.assertEqual(code, 1)
+        self.assertLess(time.time() - t0, 30)                           # not the job's 60 s
+        self.assertIsNotNone(started[0].poll())                         # the job is not left running
+
+
 if __name__ == "__main__":
     unittest.main()

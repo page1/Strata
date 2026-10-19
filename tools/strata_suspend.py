@@ -125,8 +125,23 @@ def suspend(base: str, key: str | None, wait: int, keep_gpu: bool = False, hold_
                                                    **({"hold_pids": hold_pids} if hold_pids else {})}, key,
                         timeout=SUSPEND_TIMEOUT_S)
         if st == 0 and hibernated_after_all(base, key):
-            st, body = 200, {"status": "unloaded", "hibernated": True}
+            if not hold_pids:
+                st, body = 200, {"status": "unloaded", "hibernated": True}
+            elif time.time() < deadline:
+                # the answer was lost: hibernated is not proof that THIS job holds it (an earlier latch would say the
+                # same) - ask again, so the server acknowledges the hold (an /unload of a stopped model only adds it)
+                continue
         status = body.get("status")
+        if st == 200 and status in ("not loaded", "unloaded"):
+            unheld = unacknowledged(hold_pids, body)
+            if unheld:   # the job must not start unless the server lists it as a holder
+                if time.time() < deadline:
+                    time.sleep(2.0)
+                    continue
+                print(f"suspend failed: the server did not acknowledge the hold for pid "
+                      f"{', '.join(map(str, unheld))}; the job is not started (anything could load Strata over it)",
+                      flush=True)
+                return 1
         if st == 200 and status == "not loaded":           # off already (another job's suspend, an idle unload)
             if body.get("held_by"):
                 print(f"Strata is off already; held for pid {', '.join(map(str, body['held_by']))}: nothing loads it "
@@ -144,9 +159,6 @@ def suspend(base: str, key: str | None, wait: int, keep_gpu: bool = False, hold_
             if body.get("held_by"):
                 print(f"held for pid {', '.join(map(str, body['held_by']))}: nothing resumes Strata until "
                       f"{'it ends' if len(body['held_by']) == 1 else 'they all end'}; then the server resumes it",
-                      flush=True)
-            elif hold_pids:
-                print("WARNING: the hold was not set (the process had ended?): any request can resume Strata",
                       flush=True)
             if body.get("live_saved") is False:
                 print("WARNING: the current conversation was not saved (not enough free RAM to park it); it is "
@@ -177,13 +189,34 @@ def suspend(base: str, key: str | None, wait: int, keep_gpu: bool = False, hold_
         return 1
 
 
-def hold(base: str, key: str | None, pids: list) -> bool:
-    st, body = http(base + "/hold", "POST", {"hold_pids": pids}, key, timeout=30)
-    if st == 400 and "no such process" in str(body.get("error", {}).get("message")):
-        return False                                     # the job ended already: the wrapper's own hold covers it
-    if st != 200:
-        print(f"WARNING: could not hold Strata for pid {pids} (HTTP {st}): {body.get('error', {}).get('message')}")
-    return st == 200
+def pid_alive(pid: int) -> bool:
+    """Unknown (no psutil, no access) counts as alive: its hold is still wanted."""
+    try:
+        import psutil
+        return psutil.pid_exists(pid)
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def unacknowledged(hold_pids: list | None, body: dict) -> list:
+    """The live processes of hold_pids that the server's answer does not list as holders."""
+    held = set(body.get("held_by") or [])
+    return [p for p in hold_pids or [] if p not in held and pid_alive(p)]
+
+
+def hold(base: str, key: str | None, pids: list, tries: int = 3) -> bool | None:
+    """True: the server holds Strata for `pids`.  None: the job ended already (the wrapper's own hold covered it).
+    False: not acknowledged after `tries` attempts - the caller must not leave the job running unheld."""
+    for attempt in range(tries):
+        st, body = http(base + "/hold", "POST", {"hold_pids": pids}, key, timeout=30)
+        if st == 400 and "no such process" in str(body.get("error", {}).get("message")):
+            return None
+        if st == 200 and not unacknowledged(pids, body):
+            return True
+        if attempt + 1 < tries:
+            time.sleep(1.0)
+    print(f"could not hold Strata for pid {pids} (HTTP {st}): {body.get('error', {}).get('message')}", flush=True)
+    return False
 
 
 def job_pids(pid: int) -> list:
@@ -195,6 +228,25 @@ def job_pids(pid: int) -> list:
         return [pid] + [c.pid for c in psutil.Process(pid).children(recursive=True)]
     except Exception:  # noqa: BLE001 - no psutil, or the job already ended
         return [pid]
+
+
+def stop_tree(pid: int) -> None:
+    """The job and every process it started (no psutil: the job only)."""
+    try:
+        import psutil
+        p = psutil.Process(pid)
+        procs = p.children(recursive=True) + [p]
+        for x in procs:
+            try:
+                x.kill()
+            except psutil.Error:
+                pass
+        psutil.wait_procs(procs, timeout=10)
+    except Exception:  # noqa: BLE001
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
 
 
 def release(base: str, key: str | None) -> None:
@@ -258,11 +310,16 @@ def run_and_resume(a) -> int:
     rec = J.start(cmd, log=str(log))
     proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_job", "--log", str(log),   # appends the
                              *(["--record", str(rec)] if rec else []), "--", *cmd])                    # job's output
-    hold(base, key, [proc.pid])                                    # at once: a kill of this console cannot orphan it
+    first = hold(base, key, [proc.pid])                            # at once: a kill of this console cannot orphan it
     J.update(rec, job=[{"pid": proc.pid, "started": J.proc_started(proc.pid)}])
     held = job_pids(proc.pid)
-    hold(base, key, held)                                          # + its children (a venv launcher's interpreter)
+    second = hold(base, key, held) if first is not None else None  # + its children (a venv launcher's interpreter)
     J.update(rec, job=[{"pid": x, "started": J.proc_started(x)} for x in held])
+    if first is False or second is False:                          # not left running unheld (see run)
+        print("stopping the job: the server did not acknowledge its hold", flush=True)
+        stop_tree(proc.pid)
+        proc.wait()
+        J.update(rec, hold_failed=True)
     code = J.relay(proc, str(log))                                 # the new console shows progress live
     finish_job(rec, proc, code)
     out = io.StringIO()
@@ -494,11 +551,20 @@ def main() -> int:
     proc, code = None, None
     try:
         proc, log = start_job(cmd, rec)
-        hold(base, key, [proc.pid])                              # at once: if this wrapper is killed, the job holds it
+        first = hold(base, key, [proc.pid])                      # at once: if this wrapper is killed, the job holds it
         J.update(rec, job=[{"pid": proc.pid, "started": J.proc_started(proc.pid)}])
         held = job_pids(proc.pid)
-        hold(base, key, held)                                    # + its children (a venv launcher's interpreter)
+        second = hold(base, key, held) if first is not None else None   # + its children (a venv launcher's interpreter)
         J.update(rec, job=[{"pid": x, "started": J.proc_started(x)} for x in held])
+        if first is False or second is False:
+            # the server would not hold the job's own processes: with this wrapper killed later, the job would run
+            # unheld and a request could load Strata over it - so it is not left running
+            print("stopping the job: the server did not acknowledge its hold (see above); nothing of it ran past "
+                  "its start", flush=True)
+            stop_tree(proc.pid)
+            code = proc.wait()
+            J.update(rec, state="done", exit=code, ended=time.time(), hold_failed=True)
+            return 1
         code = J.relay(proc, log) if log else proc.wait()
     except KeyboardInterrupt:
         code = 130
