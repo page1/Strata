@@ -237,7 +237,7 @@ int main() {
     }
     check(tier_files(dir) == 0, "the tier removes its files when it ends");
 
-    {   // a read the RAM preflight refuses: nothing restored, the files are gone anyway
+    {   // a read the RAM preflight refuses (also the live state alone): nothing restored, the files are gone anyway
         ConversationDiskTier tier(opts(dir, GiB));
         check(tier.open(e) && tier.put(split_image(400, 10)), "put for a refused read");
         tier.wait_idle();
@@ -247,6 +247,47 @@ int main() {
         check(!ok && back.kv.empty() && back.stage_images.empty() && tier.size() == 0 && tier_files(dir) == 0,
               "refused read: empty image, entry and files gone");
         check(tier.stats().read_failed == 1, "a failed read is counted");
+    }
+    {   // no RAM for the checkpoints, room for the live state: it comes back without them
+        ConversationDiskTier tier(opts(dir, GiB));
+        const SavedConversation original = image(400, 30);
+        check(tier.open(e) && tier.put(image(400, 30)), "put for a lean read");
+        tier.wait_idle();
+        const auto m = tier.best(prompt_of(450), {}, false);
+        std::vector<uint64_t> asked;
+        SavedConversation back;
+        check(m.live, "lean read: a live-state match");
+        const bool ok = tier.take(m.id, m.tokens, back, e, [&](uint64_t need, std::string& why) {
+            asked.push_back(need);
+            if (asked.size() == 1) { why = "no RAM for all of it"; return false; }
+            return need < asked[0];
+        }, m.live);
+        check(ok && asked.size() == 2 && asked[1] < asked[0], "lean read: asked for less the second time");
+        check(ok && back.checkpoints.empty() && same_checkpoint(back.live, original.live) &&
+                  back.kv.size() == original.kv.size() && back.kv[0].k == original.kv[0].k,
+              "lean read: the live state and the K/V exact, no checkpoints");
+        check(tier.size() == 0 && tier_files(dir) == 0, "lean read: the files are spent");
+    }
+    {   // a checkpoint match the RAM refuses whole: no lean read (it would drop the checkpoint the request resumes
+        // from), the plain refusal - the prompt is read again
+        ConversationDiskTier tier(opts(dir, GiB));
+        check(tier.open(e) && tier.put(image(400, 30)), "put for a checkpoint match");
+        tier.wait_idle();
+        auto prompt = prompt_of(300);
+        prompt.push_back(7);   // leaves the conversation after its first checkpoint (200 tokens)
+        const auto m = tier.best(prompt, {}, false);
+        check(m.id != 0 && !m.live && m.tokens == 200, "checkpoint match: 200 tokens, not the live state");
+        size_t asked = 0;
+        SavedConversation back;
+        const bool ok = tier.take(m.id, m.tokens, back, e, [&](uint64_t, std::string& why) {
+            ++asked;
+            if (asked == 1) { why = "no RAM for all of it"; return false; }
+            return true;
+        }, m.live);
+        check(!ok && asked == 1 && back.kv.empty() && back.checkpoints.empty(),
+              "checkpoint match: refused, no lean read tried");
+        check(e.find("no RAM for all of it") != std::string::npos, "checkpoint match: the refusal says why");
+        check(tier.size() == 0 && tier_files(dir) == 0, "checkpoint match: the files are spent");
     }
 
     {   // the RAM cache's evictions go to the disk tier (set_on_evict)
