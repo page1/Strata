@@ -94,8 +94,10 @@ public:
     /// when it is still queued, else from the disk (waiting for its write when it is being written).  `admit(need,
     /// why)` is asked before each file's payload is allocated (session_file_read's RAM preflight).  `tokens` is what
     /// the request reuses (diagnostics).  On failure `out` is empty and `error` says why.
+    /// `live`: the request matched the entry's live state (Match::live).  Only then is a read the RAM refuses whole
+    /// tried again without the checkpoints; a checkpoint match needs its checkpoint, so it stays refused.
     bool take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
-              const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {});
+              const std::function<bool(uint64_t need_bytes, std::string& why)>& admit = {}, bool live = false);
 
     /// Whether images wait in the queue or are being written (their RAM is not back yet).
     bool pending() const;

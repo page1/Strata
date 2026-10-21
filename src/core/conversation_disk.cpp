@@ -436,7 +436,7 @@ void ConversationDiskTier::write(Job& job) {
 }
 
 bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& out, std::string& error,
-                                const std::function<bool(uint64_t, std::string&)>& admit) {
+                                const std::function<bool(uint64_t, std::string&)>& admit, bool live) {
     out = SavedConversation{};
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_lock<std::mutex> lock(m_);
@@ -482,13 +482,31 @@ bool ConversationDiskTier::take(uint64_t id, int64_t tokens, SavedConversation& 
     for (size_t k = 0; ok && k < files.size(); ++k) {
         SavedConversation part;
         size_t n = 0;
-        ok = session_file_read(files[k], fid, part, n, error, limits);
+        SessionStatus st;
+        ok = session_file_read(files[k], fid, part, n, error, limits, &st);
+        const bool no_ram = !ok && k == 0 && st.error == SessionError::memory;   // refused before anything was read
+        if (no_ram && live && !want.checkpoints.empty() && !limits.drop_checkpoints) {
+            // no room for its checkpoints: the live state alone (the conversation continues; only a later request
+            // that goes back before its end has no checkpoint to start from)
+            SessionReadLimits lean = limits;
+            lean.drop_checkpoints = true;
+            lean.checkpoint_count = want.checkpoints.size();
+            const std::string full_refusal = error;
+            error.clear();
+            ok = session_file_read(files[k], fid, part, n, error, lean, &st);
+            if (ok) {
+                limits = lean;   // the later stages' files the same way
+                log(fmt("%lld tokens: no RAM for the %zu checkpoints (%s); the live state only",
+                        (long long) tokens, want.checkpoints.size(), full_refusal.c_str()));
+            }
+        }
         bytes += n;
         if (!ok) break;
         if (k == 0) out = std::move(part);
         else out.stage_images.push_back(std::move(part));
     }
-    if (ok && !holds(out, want.live, want.checkpoints, want.cvec)) {
+    static const std::vector<ConversationCheckpoint> no_checkpoints;
+    if (ok && !holds(out, want.live, limits.drop_checkpoints ? no_checkpoints : want.checkpoints, want.cvec)) {
         ok = false;
         error = "the files hold another conversation than their index";
     }

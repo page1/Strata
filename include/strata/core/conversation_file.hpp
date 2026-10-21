@@ -222,6 +222,12 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // read the live state only: each checkpoint is checked (its bytes still go through the hash) and dropped as it is
+    // read, so the image comes back with no checkpoints.  The preflight is then asked for the live state and one
+    // checkpoint at a time, estimated from `checkpoint_count` (the saved states are the same size: the recurrent
+    // state does not grow with the position).  For a read the RAM refuses whole.
+    bool drop_checkpoints = false;
+    size_t checkpoint_count = 0;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
