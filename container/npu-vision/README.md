@@ -2,24 +2,53 @@
 
 The picture reader from [docs/INTEL_NPU.md](../../docs/INTEL_NPU.md) runs inside an OCI
 container with the real NPU. The kernel side (the `intel_vpu` module and the firmware) stays
-on the host; the container gets the device node plus the userspace driver, copied from the
-host so the versions always match the running kernel module.
+on the host; the container gets the device node plus the userspace driver.
 
 Measured on this PC (Lenovo with the Arrow-Lake NPU, kernel `intel_vpu` 1.0, userspace
-1.10.1, OpenVINO 2026.4.1, podman 4 under Ubuntu): the chain of two IRs inside a rootful
+1.10.1, OpenVINO 2026.4.1, podman 4 under Ubuntu 24.04): the chain of two IRs inside a rootful
 container gives mean cosine 0.998390, min 0.967598 against the engine's own
 `strata-vision` embeddings - the same numbers as on bare metal - warm encode 2.3 s,
-`OK 576 24 24 2231` for a 768x768 picture.
+`OK 576 24 24 2231` for a 768x768 picture.  Those numbers are from the version-matched
+build; the public build (same driver version from Intel's packages, Ubuntu 24.04 base)
+passed the same check on this machine on 2026-10-24.
 
-## Build
+## Published image
 
 ```sh
-container/npu-vision/fetch_host_libs.sh            # collect host driver libs + the reader
+podman pull ghcr.io/sibnick/strata-npu-vision:latest     # or: docker pull
+```
+
+The published image is built by GitHub Actions from the public recipe below, from the
+`npu-vision-reader` branch of this repository; tags carry the driver and OpenVINO versions
+(`driver1.10.1-ov2026.4.1`).  It is an experimental artifact for trying the NPU reader,
+versioned by what it contains, not a release component of Strata.
+
+## Build from public sources (the published recipe)
+
+Intel's published driver packages for Ubuntu 24.04, Ubuntu's Level Zero loader, one pinned
+OpenVINO wheel.  Needs internet, nothing else:
+
+```sh
+container/npu-vision/fetch_tools.sh                      # stage the reader, exporter, health check
 podman build -t strata-npu-vision container/npu-vision
 ```
 
-Re-run both after a host NPU driver update: the copied libraries must match the kernel
-module, that is the point of copying them instead of installing another copy.
+The driver and OpenVINO versions are `ARG`s (`NPU_DRIVER_TAG`, `NPU_DRIVER_VER`); the pin
+is what this reader was measured with.  Intel changed the release packaging after this
+era, so newer driver versions need the build below unless you adapt the download.
+
+## Build version-matched to your host
+
+When the host driver is far from the pin (or your distro ships the driver as RPM), put
+your own host's userspace libraries into the image, so the container matches the running
+kernel module exactly - the ioctl ABI between them is versioned:
+
+```sh
+container/npu-vision/fetch_host_libs.sh                  # collect host driver libs + the reader
+podman build -t strata-npu-vision -f container/npu-vision/Dockerfile.host-libs container/npu-vision
+```
+
+Re-run both after a host NPU driver update: matching is the point.
 
 ## Health check, then use
 
@@ -42,13 +71,18 @@ sudo podman run -i --rm \
 # /work must be writable: the .sve output is written into it.
 ```
 
+The IR files come from `tools/vision/export_npu_encoder.py` (docs/INTEL_NPU.md says how);
+the entrypoint defaults to `/ir/encoder-1.xml:/ir/encoder-2.xml`, so mount the directory
+that holds them at `/ir`.
+
 Rootless podman can work with a one-time root setup (`echo "$USER:109:1" | sudo tee -a
 /etc/subgid`, then `--gidmapping 109:109:1 --group-add keep-groups`) - that route was
 proposed from the podman documentation and is **not yet validated** on this machine.
 
 Without `--device` (or rootless without the mapping) the reader still works on the CPU:
 add `--device CPU` as the reader's own argument (`strata-npu-vision --device CPU`), which is
-the fallback the server would see as a slow but correct reader.
+the fallback the server would see as a slow but correct reader.  Real docker was not tested
+on this machine; docker's `--device` route follows Intel's own published steps.
 
 ## Cache volume
 
@@ -95,10 +129,13 @@ Steady-state CPU while the NPU encodes is near zero; the startup compile is the 
 
 ## Files
 
-- `Dockerfile` - python:3.12-slim, pinned `openvino==2026.4.1 numpy pillow`, the copied
-  libraries, the reader.
+- `Dockerfile` - the public recipe: ubuntu:24.04, Intel's published driver debs (versions
+  are `ARG`s), `libze1`, a venv with pinned `openvino==2026.4.1 numpy pillow`, the reader.
+- `Dockerfile.host-libs` - the version-matched recipe: python:3.12-slim plus your host's
+  driver libraries.
+- `fetch_tools.sh` - stages `vendor/` (reader, exporter, health check) for the public build.
 - `fetch_host_libs.sh` - stages `lib/` (Level Zero loader + layers, the VPU driver, the NPU
-  compiler) and `vendor/` (reader, exporter, health check) for the build.
+  compiler) and `vendor/` for the version-matched build.
 - `npu_health.py` - device check, exits non-zero when the NPU is missing.
 - `entrypoint.sh` - defaults `STRATA_VISION_NPU_MODEL_IR` to `/ir/encoder-1.xml:/ir/encoder-2.xml`.
-- `lib/`, `vendor/` - build staging, regenerated by the script, not committed.
+- `lib/`, `vendor/` - build staging, regenerated by the scripts, not committed.
