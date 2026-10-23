@@ -1,0 +1,15 @@
+FROM python:3.12-slim
+
+# One wheel carries the OpenVINO runtime, the NPU plugin, numpy and pillow.
+# Pin the version: it is the one validated with the NPU reader (docs/INTEL_NPU.md).
+RUN pip install --no-cache-dir openvino==2026.4.1 numpy pillow
+
+# The host's Intel NPU userspace stack, copied by fetch_host_libs.sh so the
+# image matches the host kernel module exactly (the ioctl ABI between them is
+# versioned).  Re-run fetch_host_libs.sh and rebuild after a host driver update.
+COPY lib/ /opt/npu-lib/
+RUN cp /opt/npu-lib/*.so* /usr/lib/x86_64-linux-gnu/ && ldconfig
+
+COPY vendor/ /opt/strata/
+COPY entrypoint.sh /usr/local/bin/strata-vision-npu
+ENTRYPOINT ["/usr/local/bin/strata-vision-npu"]

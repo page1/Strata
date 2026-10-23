@@ -124,6 +124,9 @@ class Choose(unittest.TestCase):
         self.assertIsNone(VR.cpu_fallback(cpu_only))
         self.assertIsNone(VR.cpu_fallback({**sec, "cpu_exe": ""}))
         self.assertIsNone(VR.cpu_fallback({"exe": "strata-vision", "gpu": True}))   # an NVIDIA config has no fallback
+        npu = VR.cpu_fallback({"exe": "strata-vision-npu", "gpu": False, "cpu_exe": "strata-vision", "mmproj": "m.gguf",
+                               "model": "t.gguf"})
+        self.assertEqual((npu["exe"], npu["gpu"]), ("strata-vision", False))   # an NPU config keeps gpu false and falls back anyway
 
 
 class MacReader(unittest.TestCase):
@@ -265,6 +268,17 @@ class Fallback(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertEqual(len(started), 1)
         self.assertEqual(log, "")
+
+    def test_reader_with_gpu_false_falls_back_too(self):        # the NPU reader keeps gpu false so the engine reserves no VRAM for it (docs/INTEL_NPU.md)
+        cfg = {"exe": "/e/strata-vision-npu", "cpu_exe": "/e/strata-vision", "gpu": False, "mmproj": "/m/mm.gguf", "model": "/m/t.gguf"}
+        v, started, log, err = self.run_start({"strata-vision-npu": "ERR no OpenVINO NPU device found\n",
+                                               "strata-vision": "READY 2048\n"}, cfg)
+        self.assertIsNone(err)
+        self.assertEqual([Path(a[0]).name for a in started], ["strata-vision-npu", "strata-vision"])
+        self.assertNotIn("--gpu", started[0])
+        self.assertNotIn("--gpu", started[1])
+        self.assertIn("CPU", log)
+        self.assertFalse(v.stopped)
 
     def test_cpu_config_is_unchanged(self):
         cfg = {"exe": "/e/strata-vision", "gpu": False, "mmproj": "/m/mm.gguf", "model": "/m/t.gguf"}

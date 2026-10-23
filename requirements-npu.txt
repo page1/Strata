@@ -1,0 +1,8 @@
+# The Intel NPU picture reader: tools/vision/strata_vision_npu.py (docs/INTEL_NPU.md).
+# Opt-in - nothing installs this by itself: setup, the app and `strata launch` keep the CPU / GPU readers.
+# Install it on the PC that has the NPU (an Intel Core Ultra; the Intel NPU driver must also be installed):
+#     pip install -r requirements-npu.txt
+# NumPy and Pillow are already in requirements.txt (the server's own environment).
+# 2025.1 or newer: the first OpenVINO with the NPU 4000 (Lunar Lake) in the supported list; the wheel carries
+# the NPU plugin.  Not measured by the maintainers yet - see docs/INTEL_NPU.md.
+openvino>=2025.1

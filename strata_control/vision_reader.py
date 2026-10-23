@@ -152,8 +152,10 @@ def vision_section(reader: Reader, base: dict) -> dict:
 
 
 def cpu_fallback(vision_cfg: dict) -> dict | None:
-    """The same section for the CPU reader, when the GPU reader has one to fall back on; None otherwise."""
-    if not vision_cfg.get("gpu") or not vision_cfg.get("cpu_exe"):
+    """The same section for the CPU reader, when the config names one to fall back on; None otherwise.  A GPU reader names it
+    through vision_section; a reader on another accelerator (the NPU reader, docs/INTEL_NPU.md) keeps gpu false - its device
+    is not the game card - and its runner names the cpu_exe directly."""
+    if not vision_cfg.get("cpu_exe"):
         return None
     out = {k: v for k, v in vision_cfg.items() if k not in ("cpu_exe", "elastic", "elastic_mib", "elastic_idle_s")}
     out["exe"], out["gpu"] = vision_cfg["cpu_exe"], False

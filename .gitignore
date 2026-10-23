@@ -69,6 +69,7 @@ dist-hip/
 # Terminal / Desktop split: local venvs, build output and archives never enter git
 .terminal-venv/
 .terminal-test-venv/
+/.venv-npu/
 node_modules/
 *.dmg
 /release/artifacts/
