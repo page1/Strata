@@ -10,7 +10,9 @@ container gives mean cosine 0.998390, min 0.967598 against the engine's own
 `strata-vision` embeddings - the same numbers as on bare metal - warm encode 2.3 s,
 `OK 576 24 24 2231` for a 768x768 picture.  Those numbers are from the version-matched
 build; the public build (same driver version from Intel's packages, Ubuntu 24.04 base)
-passed the same check on this machine on 2026-10-24.
+passed the same checks on this machine on 2026-10-24: `READY 2560`, `OK 576 24 24 2188`,
+and its embeddings matched a bare-metal encode of the same picture at cosine mean 1.000000,
+min 1.000000 (identical at float32 - same driver, same OpenVINO, same cache).
 
 ## Published image
 
