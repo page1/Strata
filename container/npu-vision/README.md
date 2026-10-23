@@ -4,7 +4,8 @@ The picture reader from [docs/INTEL_NPU.md](../../docs/INTEL_NPU.md) runs inside
 container with the real NPU. The kernel side (the `intel_vpu` module and the firmware) stays
 on the host; the container gets the device node plus the userspace driver.
 
-Measured on this PC (Lenovo with the Arrow-Lake NPU, kernel `intel_vpu` 1.0, userspace
+Measured on this PC (Gigabyte Z890 UD WIFI6E desktop with a Core Ultra 7 265K - the
+Arrow Lake NPU, `8086:ad1d` - kernel `intel_vpu` 1.0, userspace
 1.10.1, OpenVINO 2026.4.1, podman 4 under Ubuntu 24.04): the chain of two IRs inside a rootful
 container gives mean cosine 0.998390, min 0.967598 against the engine's own
 `strata-vision` embeddings - the same numbers as on bare metal - warm encode 2.3 s,
