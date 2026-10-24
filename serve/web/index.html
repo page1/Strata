@@ -50,14 +50,17 @@
     </div>
     <div class="composer-wrap">
       <form class="st-composer" id="composer">
+        <div class="attachments queued" id="queued" hidden></div>
         <div class="attachments" id="attachments" hidden></div>
         <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message"></textarea>
         <div class="st-composer__bar">
-          <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file">
+          <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file, PDF or Office document (or drop it here)" aria-label="Attach a file">
             <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
           <input type="file" id="file" multiple hidden>
           <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
+          <button type="button" class="st-btn st-btn--icon" id="compact-btn" title="Compact: shorten old tool results, then summarize older turns if still too long (or type /compact)" aria-label="Compact this chat">
+            <svg class="st-icon"><use href="web/sprite.svg#i-layers"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
             <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
           <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling and thinking" aria-label="Sampling and thinking">
@@ -105,10 +108,21 @@
             <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
             <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
             <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
+            <span class="st-badge st-badge--reading" data-s="loading">Loading</span>
+            <span class="st-badge" data-s="suspended">Suspended</span>
+            <span class="st-badge" data-s="hibernated">Hibernated</span>
+            <span class="st-badge" data-s="unloaded">Unloaded</span>
             <span class="st-badge st-badge--error" data-s="error">Error</span>
           </span>
         </div>
         <div class="state-card__row"><span id="state-label">Waiting for a request</span><span class="muted" id="state-detail"></span></div>
+        <div class="state-card__row" id="state-requests" hidden>
+          <span class="muted" id="state-requests-text" style="white-space: pre-line"></span>
+        </div>
+        <div class="state-card__row" id="state-holders" hidden>
+          <span class="muted" id="state-holders-text"></span>
+          <button class="st-btn" id="state-stop" title="End the wrapped job(s) holding the model: it comes back in seconds">Stop the job</button>
+        </div>
         <div class="st-progress" id="state-progress"><div class="st-progress__bar" id="state-bar" style="width:0%"></div></div>
       </div>
 

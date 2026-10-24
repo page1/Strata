@@ -73,8 +73,18 @@ struct PinnedArena {
     /// Registers the deferred slices in order, publishing how many are done in `ready`, and INT_MAX once it
     /// returns (a slice CUDA refuses ends the registration, and the rest is kept resident by the working-set lock).
     void register_slices(std::atomic<int>& ready);
+    /// Local (STRATA_EARLY_ARENA): reserve only - no touch, no registration.  The caller touches it (pretouch()),
+    /// registers it (register_now()) and then fills it.
+    struct Unregistered {};
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, Unregistered);
+    /// The Windows 4 KB-page first touch by several threads (see the constructor); no-op elsewhere.
+    void pretouch();
+    /// The constructor's registration: the whole range, else per slice (up to `max_pinned_bytes`), the rest kept
+    /// resident by the working-set lock.  Called by the constructor, or later for an Unregistered arena.
+    void register_now(const std::vector<uint64_t>& bounds, uint64_t max_pinned_bytes);
     std::vector<uint64_t> bounds_;
     std::vector<uint64_t> slice_starts;
+    bool shared_ = false;             ///< backed by a shared file (not touched: that would read it)
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
     uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base
     ~PinnedArena();
@@ -83,6 +93,14 @@ struct PinnedArena {
 
     bool valid() const { return base != nullptr; }
     uint8_t* data() const { return (uint8_t*) base; }
+
+    /// Partial hibernate (Windows; a whole-registered arena of 4 KB pages, not a shared file): give the RAM back -
+    /// cudaHostUnregister, then decommit the pages, the address range staying reserved - and take it again at the
+    /// same address (commit, the pages touched by threads, cudaHostRegister); the contents are gone and must be read
+    /// again.  False with `err` (the arena as it was) when this arena cannot.
+    bool release_pages(std::string& err);
+    bool reacquire_pages(std::string& err);
+    bool released = false;
 };
 
 struct LoadStats {

@@ -9,6 +9,9 @@ bench/micro/*.bin
 bench/micro/*.dll
 bench/micro/*.txt
 *.log
+data/suspend-jobs/
+data/job-logs/
+data/strata-alive*.json
 build*/
 pack/
 logs/

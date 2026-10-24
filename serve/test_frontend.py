@@ -38,6 +38,21 @@ class EmptyAssistantHistory(unittest.TestCase):
         self.assertEqual(self.service.encode_prompt(messages, tools, kwargs),
                          self.service.encode_prompt([messages[0], messages[2]], tools, kwargs))
 
+    def test_the_effort_of_an_earlier_answer_is_kept(self):
+        """#458 follow-up: the client sends back the effort an answer was written with ("strata_effort"), and it
+        rides on the template message so render_prompt can put that answer's effort turn back where it was."""
+        messages, _, _ = openai_to_messages({"messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a", "reasoning_content": "r", "strata_effort": "low"},
+            {"role": "assistant", "content": "b", "strata_effort": "medium"},
+            {"role": "assistant", "content": "c", "strata_effort": "high"},
+            {"role": "assistant", "content": "d", "strata_effort": "nonsense"},
+            {"role": "user", "content": "next", "strata_effort": "low"},
+        ]})
+        self.assertEqual(messages[1].get("strata_effort"), "low")
+        self.assertEqual(messages[2].get("strata_effort"), "medium")
+        self.assertFalse(any("strata_effort" in m for m in (messages[0], messages[3], messages[4], messages[5])))
+
     def test_text_and_tool_calls_are_kept(self):
         messages, tools, kwargs = openai_to_messages({"messages": [
             {"role": "user", "content": "haz un ls"},

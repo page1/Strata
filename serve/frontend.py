@@ -56,14 +56,16 @@ class ChatTemplate:
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
-        # Do not use completed empty assistant turns as examples for the next reply. Keep the final message.
-        # (#843.  STRATA_KEEP_EMPTY_TURNS=1 renders them as before.)
-        messages = [m for i, m in enumerate(messages)
-                    if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
-                                                      and not _text_of(m.get("content")).strip()
-                                                      and not _has_image(m.get("content")) and not m.get("tool_calls"))]
-        return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
-                                    **kwargs)
+        return self.template.render(messages=self.kept(messages), tools=tools,
+                                    add_generation_prompt=add_generation_prompt, **kwargs)
+
+    @staticmethod
+    def kept(messages: list[dict]) -> list[dict]:
+        """The turns this template renders: #843 drops completed empty assistant turns (except the last)."""
+        return [m for i, m in enumerate(messages)
+                if i == len(messages) - 1 or os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1" or not (isinstance(m, dict) and m.get("role") == "assistant"
+                                                  and not _text_of(m.get("content")).strip()
+                                                  and not _has_image(m.get("content")) and not m.get("tool_calls"))]
 
     def _detect_caps(self) -> dict[str, bool]:
         """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
@@ -532,6 +534,10 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         out = {"role": role, "content": _parts_of(content) if images else _text_of(content)}
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
+        # #458 follow-up: the effort an earlier answer was written with, so its effort turn can be rendered back
+        # exactly where the engine saw it (serve/server.py render_prompt, "effort_position": "end")
+        if role == "assistant" and m.get("strata_effort") in ("low", "medium"):
+            out["strata_effort"] = m["strata_effort"]
         if m.get("tool_calls"):
             calls = []
             for c in _object_list(m["tool_calls"], "tool_calls"):

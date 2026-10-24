@@ -1,3 +1,9 @@
+> **This is an experimental fork, and it works on Windows** (developed and used daily on Windows 11, natively, with
+> an NVIDIA card). It adds what coding agents need when they also run heavy jobs on the same PC: the model gives the
+> GPU and RAM to a job and comes back by itself with its conversations, a lease lock keeps it away until the job ends
+> (even after a crash), and cut-off agent sessions are told to continue. Based on Strata 0.1.44.1 + PR #1937, older
+> than upstream 0.2.x. **Read [FORK.md](FORK.md) first** - and install with `python setup.py --build`.
+
 <h1 align="center">Strata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)

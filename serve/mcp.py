@@ -34,7 +34,8 @@ import urllib.request
 from serve.winjob import contain
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
-DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0}
+DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0,
+            "subagents": False, "subagent_max_rounds": None}
 
 
 class McpError(RuntimeError):
@@ -587,7 +588,8 @@ class McpHub:
                             "tools": [{"name": names.get(t["name"], t["name"]), "tool": t["name"],
                                        "description": str(t.get("description") or "")[:300]} for t in s.tools]})
         return {"servers": servers, "tools": len(routes),
-                "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds")}}
+                "settings": {k: self.settings[k] for k in ("timeout_s", "max_result_chars", "max_rounds", "subagents",
+                                                           "subagent_max_rounds")}}
 
     def close(self):
         for s in self.servers.values():
@@ -628,7 +630,8 @@ def servers_from(block, where: str) -> dict[str, dict]:
 
 
 def settings_from(cfg: dict) -> dict:
-    """The run config's optional `"mcp"` block: timeout_s, max_result_chars, max_rounds, start_timeout_s."""
+    """The run config's optional `"mcp"` block: timeout_s, max_result_chars, max_rounds, start_timeout_s, subagents,
+    subagent_max_rounds (a helper's own tool rounds; max_rounds when unset)."""
     out = {}
     for key, value in (cfg.get("mcp") or {}).items():
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -636,10 +639,14 @@ def settings_from(cfg: dict) -> dict:
             if not number or value <= 0:
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a number of seconds > 0")
             out[key] = float(value)
-        elif key in ("max_result_chars", "max_rounds"):
+        elif key in ("max_result_chars", "max_rounds", "subagent_max_rounds"):
             if not number or value != int(value) or value < 1:
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a positive integer")
             out[key] = int(value)
+        elif key == "subagents":
+            if not isinstance(value, bool):
+                raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected true or false")
+            out[key] = value
         else:
             print(f"[strata] config mcp.{key}={value!r}: unknown key, ignored", flush=True)
     return out

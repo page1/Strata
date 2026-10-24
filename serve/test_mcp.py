@@ -298,6 +298,19 @@ class ToolLoop(unittest.TestCase):
         self.assertIn("<tool_response>\nhello from the tool\n</tool_response>", second)
         self.assertEqual(cs[-1]["usage"]["prompt_tokens"], len(self.engine.prompts[1]))
 
+    def test_a_non_default_effort_round_renders_its_effort_turn_back(self):
+        """#458 follow-up ("effort_position": "end"): every round's assistant message carries the request's effort, so
+        the next round renders that effort turn back where the engine holds it - round 2's prompt starts with round
+        1's prompt exactly, and the round's answer is not read again."""
+        self.start(call_script("fake__echo", text="hello from the tool"), "</think>\n\nThe tool said hello.")
+        self.svc.effort_end = True
+        code, text = self.post({"strata_mcp": True, "reasoning_effort": "low"})
+        self.assertEqual(code, 200, text)
+        self.assertEqual(len(self.engine.prompts), 2, text)
+        first, second = self.engine.prompts[0], self.engine.prompts[1]
+        self.assertEqual(second[:len(first)], first, "round 2 did not start with round 1's prompt (the effort turn)")
+        self.assertIn("Reasoning effort is set to low", self.engine.prompt_text(1))
+
     def test_a_call_the_output_ends_inside_is_not_run(self):
         """#211: the model's turn ends inside an MCP call: nothing runs (it used to run with no arguments)."""
         script = call_script("fake__echo", text="hello from the tool")
@@ -310,6 +323,264 @@ class ToolLoop(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertNotIn('"call"', Path(self.log.name).read_text())    # nothing ran
         self.assertEqual(cs[-1]["choices"][0]["finish_reason"], "stop")
+
+    def test_a_rounds_calls_run_at_the_same_time(self):
+        """Two calls of 1 s each in one round: the round takes ~1 s, and the results go back in the order written."""
+        two = ("</think>\n\nBoth.\n\n<tool_call>\n<function=fake__sleep>\n<parameter=seconds>\n1\n</parameter>\n"
+               "</function>\n</tool_call>\n<tool_call>\n<function=fake__echo>\n<parameter=text>\nsecond\n"
+               "</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=fake__sleep>\n<parameter=seconds>\n1\n"
+               "</parameter>\n</function>\n</tool_call>")
+        self.start(two, "</think>\n\nDone.")
+        t0 = time.monotonic()
+        code, text = self.post({"strata_mcp": True})
+        took = time.monotonic() - t0
+        self.assertEqual(code, 200, text)
+        mcp = [c["strata_mcp"] for c in self.chunks(text) if "strata_mcp" in c]
+        self.assertEqual([m["event"] for m in mcp if m["event"] != "start"], ["call"] * 3 + ["result"] * 3)
+        self.assertLess(took, 1.9)
+        second = self.engine.prompt_text(1)
+        self.assertLess(second.index("<tool_response>\nsecond"), second.rindex("<tool_response>"))   # order kept
+
+    def test_a_tool_that_crashes_does_not_end_the_answer(self):
+        """An unexpected error in a tool call (not McpError) used to end the answer silently, as if it was stopped -
+        inside a helper, the helper and every call after it showed "Not run".  Now it is the tool's error."""
+        from unittest import mock
+        self.hub.settings["subagents"] = True
+        self.start(call_script("subagent", task="Look it up."), call_script("fake__echo", text="x"),
+                   "</think>\n\nThe tool broke; reporting what I have.", "</think>\n\nDone anyway.")
+        with mock.patch.object(self.hub, "call", side_effect=RuntimeError("boom")):
+            code, text = self.post({"strata_mcp": True})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        result = [c["strata_mcp"] for c in cs if c.get("strata_mcp", {}).get("event") == "result"]
+        self.assertTrue(result[0]["ok"])                                  # the helper reported
+        self.assertIn("The tool broke", result[0]["text"])
+        self.assertIn("error: the tool failed (RuntimeError: boom)", self.engine.prompt_text(2))
+        content = "".join((c["choices"][0]["delta"].get("content") or "") for c in cs)
+        self.assertTrue(content.endswith("Done anyway."))
+
+    def test_run_a_helper_from_the_page(self):
+        """POST /v1/subagent: the page's Run on a helper block - the helper runs with the task as given, and the
+        result comes back as the block's events."""
+        self.hub.settings["subagents"] = True
+        self.start(call_script("fake__echo", text="found"), "</think>\n\nReport: found it.")
+        req = urllib.request.Request(self.base + "/v1/subagent", data=json.dumps(
+            {"task": "Find it.", "label": "finder"}).encode(), headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            text = r.read().decode()
+        events = [c["strata_mcp"] for c in self.chunks(text)]
+        self.assertIn("progress", [e["event"] for e in events])
+        self.assertEqual(events[-1]["event"], "result")
+        self.assertTrue(events[-1]["text"].startswith("Report: found it."))
+        self.assertIn("Find it.", self.engine.prompt_text(0))
+        self.assertNotIn('"name": "subagent"', self.engine.prompt_text(0))     # still no helper inside a helper
+
+    def test_run_a_helper_needs_helpers_on(self):
+        self.start("x")
+        req = urllib.request.Request(self.base + "/v1/subagent", data=b'{"task": "x"}',
+                                     headers={"Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(req, timeout=30)
+        self.assertEqual(e.exception.code, 404)
+
+    def test_subagent_off_by_default(self):
+        self.start("</think>\n\nNo tools needed.")
+        self.post({"strata_mcp": True})
+        self.assertNotIn('"name": "subagent"', self.engine.prompt_text(0))
+
+    def test_subagent_runs_in_a_fresh_context(self):
+        """mcp.subagents: the helper gets only the task, the MCP tools but not itself, and its final answer is the
+        call's result; its own tool call and result never enter the main conversation."""
+        self.hub.settings["subagents"] = True
+        self.start(call_script("subagent", task="Find the magic word.", label="finder"),   # main: hands it off
+                   call_script("fake__echo", text="xyzzy-from-the-tool"),                  # helper: uses a tool
+                   "</think>\n\nThe magic word is xyzzy.",                                 # helper: its report
+                   "</think>\n\nThe helper says: xyzzy.")                                  # main: answers
+        code, text = self.post({"strata_mcp": True})
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        mcp = [c["strata_mcp"] for c in cs if "strata_mcp" in c]
+        events = [m["event"] for m in mcp]
+        self.assertEqual(events[:2], ["start", "call"])
+        self.assertIn("progress", events)
+        self.assertTrue(any("echo" in m.get("text", "") for m in mcp if m["event"] == "progress"))
+        result = [m for m in mcp if m["event"] == "result"]
+        self.assertEqual(len(result), 1)                               # the helper's tool result is not an event here
+        self.assertTrue(result[0]["ok"])
+        self.assertEqual(result[0]["text"].split("\n\n[helper id:")[0], "The magic word is xyzzy.")
+        self.assertEqual(len(self.engine.prompts), 4)
+        main0, helper0, helper1, main1 = (self.engine.prompt_text(i) for i in range(4))
+        self.assertIn('"name": "subagent"', main0)
+        self.assertNotIn('"name": "subagent"', helper0)                # no helper starts another
+        self.assertIn('"name": "fake__echo"', helper0)
+        self.assertIn("You are a helper agent", helper0)
+        self.assertIn("Find the magic word.", helper0)
+        self.assertNotIn("check it", helper0)                          # the main chat is not shown to it
+        self.assertIn("<tool_response>\nxyzzy-from-the-tool\n</tool_response>", helper1)
+        self.assertTrue(main1.startswith(main0))
+        self.assertIn("<tool_response>\nThe magic word is xyzzy.\n\n[helper id: h-", main1)
+        self.assertNotIn("xyzzy-from-the-tool", main1)
+        content = "".join((c["choices"][0]["delta"].get("content") or "") for c in cs)
+        self.assertEqual(content, "Let me check.The helper says: xyzzy.")   # the helper's words are not streamed
+
+    def test_subagent_at_its_round_limit_writes_its_report(self):
+        """max_rounds is 2 here: the helper's third call is answered "not run" and it gets one more turn for its
+        report, instead of returning the notes it wrote before that call."""
+        self.hub.settings["subagents"] = True
+        echo = call_script("fake__echo", text="fact")
+        self.start(call_script("subagent", task="Research it."),
+                   echo, echo, echo,                                              # helper: 2 rounds run, 1 not
+                   "</think>\n\nReport: fact, twice.",                            # helper: the wrap-up turn
+                   "</think>\n\nDone.")                                           # main
+        code, text = self.post({"strata_mcp": True})
+        self.assertEqual(code, 200, text)
+        mcp = [c["strata_mcp"] for c in self.chunks(text) if "strata_mcp" in c]
+        result = [m for m in mcp if m["event"] == "result"]
+        self.assertTrue(result[-1]["ok"])
+        self.assertTrue(result[-1]["text"].startswith("Report: fact, twice."))
+        self.assertIn("limit of 2 tool rounds", result[-1]["text"])
+        self.assertIn("used all your tool calls", self.engine.prompt_text(4))
+        self.assertEqual(len(self.engine.prompts), 6)
+
+    def test_subagent_has_its_own_round_limit(self):
+        self.hub.settings.update(subagents=True, subagent_max_rounds=3)
+        echo = call_script("fake__echo", text="fact")
+        self.start(call_script("subagent", task="Research it."), echo, echo, echo,   # 3 rounds: more than max_rounds 2
+                   "</think>\n\nReport: three facts.", "</think>\n\nDone.")
+        code, text = self.post({"strata_mcp": True})
+        result = [c["strata_mcp"] for c in self.chunks(text) if c.get("strata_mcp", {}).get("event") == "result"]
+        self.assertTrue(result[-1]["text"].startswith("Report: three facts.\n\n[helper id:"))
+        self.assertEqual(len(self.engine.prompts), 6)
+
+    def test_subagent_whose_context_fills_up(self):
+        """A helper's prompt grows past the context: the main answer goes on with what the helper wrote."""
+        self.hub.settings["subagents"] = True
+        big = call_script("fake__big")
+        self.start(call_script("subagent", task="Read it all."), big, big, big, "</think>\n\nDone.")
+        self.engine.max_context = 3600        # the main prompt ~2,800 tokens; each capped result ~560 more
+        code, text = self.post({"strata_mcp": True})
+        self.assertEqual(code, 200, text)
+        result = [c["strata_mcp"] for c in self.chunks(text) if c.get("strata_mcp", {}).get("event") == "result"]
+        self.assertIn("stopped before its report", result[0]["text"])     # the helper's (then main reads the rest)
+
+    def _leave_early(self, body):
+        """Send a streamed request, read its first event, then hang up (a page reload)."""
+        import socket
+        payload = json.dumps({"model": "m", "messages": [{"role": "user", "content": "check it"}], "stream": True,
+                              **body}).encode()
+        sock = socket.create_connection(("127.0.0.1", self.httpd.server_address[1]), timeout=30)
+        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                     b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload)
+        got = b""
+        while b"data: {" not in got:
+            got += sock.recv(4096)
+        self.assertIn(b" 200 ", got.split(b"\r\n", 1)[0])
+        sock.close()
+
+    def _get(self, path):
+        try:
+            with urllib.request.urlopen(self.base + path, timeout=60) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.read().decode()
+
+    def test_detached_run_survives_the_page(self):
+        """strata_run: the page hangs up mid-answer; the run goes on, and GET /v1/runs/<id> streams all of it."""
+        self.start(call_script("fake__echo", text="hello from the tool"), "</think>\n\nThe tool said hello.", delay_s=0.01)
+        self._leave_early({"strata_mcp": True, "strata_run": "run-abc12345"})
+        code, text = self._get("/v1/runs/run-abc12345")
+        self.assertEqual(code, 200, text)
+        cs = self.chunks(text)
+        content = "".join((c["choices"][0]["delta"].get("content") or "") for c in cs)
+        self.assertEqual(content, "Let me check.The tool said hello.")
+        self.assertTrue(text.rstrip().endswith("data: [DONE]"))
+        self.assertEqual(len(self.engine.prompts), 2)                  # it was not cancelled by the hang-up
+        code, again = self._get("/v1/runs/run-abc12345")               # a finished run streams again, whole
+        self.assertEqual(again, text)
+        self.assertEqual(self._get("/v1/runs/run-nosuchrun")[0], 404)
+
+    def _post_json(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_a_message_queued_during_the_run_reaches_the_agent(self):
+        """POST /v1/runs/<id>/message while a tool runs: the next round reads it with the tool's result."""
+        self.start(call_script("fake__sleep", seconds="1.5"), "</think>\n\nNoted.")
+        self._leave_early({"strata_mcp": True, "strata_run": "run-inbox001"})
+        code, body = self._post_json("/v1/runs/run-inbox001/message", {"id": "n1", "text": "Share the results."})
+        self.assertEqual((code, body["status"]), (200, "queued"))
+        code, text = self._get("/v1/runs/run-inbox001")
+        notes = [c["strata_mcp"] for c in self.chunks(text) if c.get("strata_mcp", {}).get("event") == "user_note"]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["notes"], ["n1"])
+        second = self.engine.prompt_text(1)
+        self.assertIn("A message from the user, sent while you were working", second)
+        self.assertIn("Share the results.\n</tool_response>", second)
+        code, body = self._post_json("/v1/runs/run-inbox001/message", {"id": "n2", "text": "Too late."})
+        self.assertEqual((code, body["status"]), (409, "ended"))
+
+    def test_detached_run_cancel(self):
+        self.start("</think>\n\n" + "word " * 2000, delay_s=0.01)
+        self._leave_early({"strata_mcp": True, "strata_run": "run-cancel01"})
+        req = urllib.request.Request(self.base + "/v1/runs/run-cancel01/cancel", data=b"{}",
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            self.assertEqual(r.status, 200)
+        code, text = self._get("/v1/runs/run-cancel01")
+        content = "".join((c["choices"][0]["delta"].get("content") or "") for c in self.chunks(text))
+        self.assertLess(content.count("word"), 2000)
+
+    def test_without_strata_run_a_hang_up_still_cancels(self):
+        self.start("</think>\n\n" + "word " * 2000, delay_s=0.01)
+        self._leave_early({"strata_mcp": True})
+        time.sleep(1.5)
+        self.assertEqual(self._get("/v1/runs/anything1")[0], 404)
+
+    def test_subagent_continue(self):
+        """A report ends with the helper's id; `continue` with that id gives the helper its whole conversation back
+        plus the new task."""
+        import uuid
+        from unittest import mock
+        self.hub.settings["subagents"] = True
+        self.start(call_script("subagent", task="Find the first fact."),
+                   "</think>\n\nFirst fact: alpha.",                                       # helper's report
+                   call_script("subagent", task="Now find the second fact.", **{"continue": "h-abcdef"}),
+                   "</think>\n\nSecond fact: beta.",                                       # the same helper, again
+                   "</think>\n\nBoth found.")
+        with mock.patch.object(uuid, "uuid4", return_value=uuid.UUID("abcdef00" * 4)):
+            code, text = self.post({"strata_mcp": True})
+        result = [c["strata_mcp"] for c in self.chunks(text) if c.get("strata_mcp", {}).get("event") == "result"]
+        self.assertIn("helper id: h-abcdef", result[0]["text"])
+        self.assertTrue(result[1]["text"].startswith("Second fact: beta."))
+        again = self.engine.prompt_text(3)                                # the helper's second turn
+        self.assertIn("Find the first fact.", again)
+        self.assertIn("First fact: alpha.", again)
+        self.assertIn("Now find the second fact.", again)
+        self.assertTrue(again.startswith(self.engine.prompt_text(1)[:200]))
+
+    def test_subagent_continue_unknown(self):
+        self.hub.settings["subagents"] = True
+        self.start(call_script("subagent", task="More.", **{"continue": "h-000000"}), "</think>\n\nOk.")
+        code, text = self.post({"strata_mcp": True})
+        result = [c["strata_mcp"] for c in self.chunks(text) if c.get("strata_mcp", {}).get("event") == "result"]
+        self.assertFalse(result[0]["ok"])
+        self.assertIn("no helper", result[0]["text"])
+
+    def test_subagent_without_a_task(self):
+        self.hub.settings["subagents"] = True
+        self.start(call_script("subagent", label="nobody"), "</think>\n\nOk.")
+        code, text = self.post({"strata_mcp": True})
+        result = [c["strata_mcp"] for c in self.chunks(text) if c.get("strata_mcp", {}).get("event") == "result"]
+        self.assertFalse(result[0]["ok"])
+        self.assertIn("task", result[0]["text"])
+        self.assertEqual(len(self.engine.prompts), 2)
 
     def test_non_stream(self):
         self.start(call_script("fake__add", a=2, b=3), "</think>\n\n5.")

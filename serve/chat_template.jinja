@@ -111,6 +111,12 @@
     {%- elif message.role == "user" %}
         {{- '<|im_start|>' + message.role + '\n' + content + '<|im_end|>' + '\n' }}
     {%- elif message.role == "assistant" %}
+        {#- #458 follow-up: an answer written with a non-default effort had a short system turn right before it
+            ("effort_position": "end"); the client sends that effort back as message.strata_effort, and only a server
+            with effort_position "end" passes effort_texts, so the default path renders exactly as before #}
+        {%- if effort_texts is defined and message.strata_effort in ('low', 'medium') %}
+            {{- '<|im_start|>system\n' + effort_texts[message.strata_effort] + '<|im_end|>\n' }}
+        {%- endif %}
         {%- set reasoning_content = '' %}
         {%- if message.reasoning_content is string %}
             {%- set reasoning_content = message.reasoning_content %}

@@ -140,6 +140,16 @@ using SessionPhase = std::function<void(const char* phase, uint64_t bytes)>;
 // 4 MiB (a slow disk or network folder at 4 MiB/s), at most an hour.  1.2 GB: 345 s.
 int64_t session_phase_limit_s(uint64_t bytes);
 
+// The disk tier's prefix check (conversation_disk.hpp): one hash per whole kSessionChunkBytes of a K/V part.
+constexpr uint64_t kSessionChunkBytes = uint64_t(1) << 20;
+uint64_t session_chunk_hash(const void* data, size_t n);
+struct SessionPartChunks {
+    std::array<std::vector<uint64_t>, 5> part;   // k, v, k_scale, v_scale, pooled
+};
+// A checkpoint's state, hashed: two checkpoints with the same tokens and the same hash are the same checkpoint (a
+// delta file then refers to its parent's copy instead of writing it again).
+uint64_t session_checkpoint_hash(const ConversationCheckpoint& c);
+
 // Optional knobs of a write.
 struct SessionWriteOptions {
     // the free-space PREFLIGHT: refused when the disk has less than the new file plus this many bytes free before the
@@ -151,6 +161,12 @@ struct SessionWriteOptions {
     SessionPhase phase;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
     std::function<int(const char* step)> fault;
+    // out (optional): the payload hash, which a delta file names its parent by
+    uint64_t* payload_hash = nullptr;
+    uint64_t* payload_bytes = nullptr;   // out (optional): the payload's length (the other half of a parent's name)
+    // out (optional): per K/V layer, one session_chunk_hash per whole kSessionChunkBytes of each part's bytes in this
+    // file, from the part's first byte in it (0, or a delta's prefix); a part's last partial chunk has none
+    std::vector<SessionPartChunks>* chunks = nullptr;
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
@@ -174,10 +190,37 @@ struct SessionKvSource {
     std::function<bool(size_t part, size_t offset, void* dst, size_t n)> read;
     std::function<std::string()> error;
 };
+// The reverse of SessionKvSource: one K/V layer written straight to where it lives while a streamed read parses
+// it.  The file's layer header must equal this one and each part's size `sizes[part]`; its bytes go to
+// `write(part, offset, src, n)` in pieces of at most 16 MiB.
+struct SessionKvTarget {
+    int format = 0;
+    int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
+    std::array<size_t, 5> sizes{};
+    std::function<bool(size_t part, size_t offset, const void* src, size_t n)> write;
+    std::function<std::string()> error;
+};
 // `meta` carries everything but the K/V (meta.kv must be empty); `kv` supplies the layers in order.
 bool session_file_write(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
                         const SessionFileIdentity& id, size_t& bytes, std::string& error,
                         const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
+
+// A delta file of the disk tier (conversation_disk.hpp): what changed since its parent, a session file or another
+// delta.  Version 2: the header's two reserved fields hold the parent's payload hash and length, so a delta is never
+// read against another parent.  Every file keeps its own payload hash.
+struct SessionDelta {
+    uint64_t parent_hash = 0, parent_payload = 0;
+    // per checkpoint of `meta`, in order: its index in the parent chain's checkpoints (its state is not written
+    // again), or -1 (written)
+    std::vector<int64_t> checkpoint_refs;
+    // per K/V layer and part: the bytes [0, prefix) the chain holds already; only [prefix, size) is written.  A
+    // multiple of kSessionChunkBytes, or the part's whole size.
+    std::vector<std::array<uint64_t, 5>> prefix;
+};
+// `meta` carries everything but the K/V (meta.kv must be empty); `kv` supplies the layers, each at its whole size.
+bool session_delta_write(const std::string& path, const SavedConversation& meta, const std::vector<SessionKvSource>& kv,
+                         const SessionDelta& delta, const SessionFileIdentity& id, size_t& bytes, std::string& error,
+                         const SessionWriteOptions& options = {}, SessionStatus* status = nullptr);
 
 // The checkpoints worth a disk write: the deepest one (the next turn's resume point when the live tail was
 // rewritten).  Earlier checkpoints only serve edits further back and cost ~118 MB each at this geometry.
@@ -222,6 +265,12 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // read the live state only: each checkpoint is checked (its bytes still go through the hash) and dropped as it is
+    // read, so the image comes back with no checkpoints.  The preflight is then asked for the live state and one
+    // checkpoint at a time, estimated from `checkpoint_count` (the saved states are the same size: the recurrent
+    // state does not grow with the position).  For a read the RAM refuses whole.
+    bool drop_checkpoints = false;
+    size_t checkpoint_count = 0;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);
@@ -234,6 +283,22 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
+// The same with the K/V streamed into `kv` (one target per layer, in order) instead of RAM: `image` gets all but the
+// K/V bytes (its layers keep their headers), and the RAM check (limits.admit) is asked for that part only.  The
+// payload hash is checked after the bytes are written: on false the targets may hold part of the file.
+bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
+                       const std::vector<SessionKvTarget>& kv, size_t& bytes, std::string& error,
+                       const SessionReadLimits& limits = {}, SessionStatus* status = nullptr);
+
+// Reads a chain: `paths[0]` a session file, each next one a delta of the one before (its parent's hash and length
+// must match), into `image` - or with `kv` the K/V streamed into the targets, as session_file_read (the last file's
+// layers must equal the targets).  Each file's header, identity, bounds and payload hash are checked as
+// session_file_read checks them; the RAM check (limits.admit) is asked once, for all the files together.
+// limits.drop_checkpoints is not supported.  `hashes` (optional): each file's payload hash, in order.
+bool session_chain_read(const std::vector<std::string>& paths, const SessionFileIdentity& id, SavedConversation& image,
+                        const std::vector<SessionKvTarget>* kv, size_t& bytes, std::string& error,
+                        const SessionReadLimits& limits = {}, SessionStatus* status = nullptr,
+                        std::vector<uint64_t>* hashes = nullptr);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC

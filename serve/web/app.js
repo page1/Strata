@@ -100,7 +100,7 @@ $("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); 
 let health = {model: "strata", images: false, max_context: 0};
 async function loadHealth() {
   try {
-    health = await (await fetch("health")).json();
+    health = await (await fetch("health", {headers: headers()})).json();   // local: who is working shows with the key only
     $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
     $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
@@ -175,6 +175,13 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 
+// local: the states with the model off the GPU or out of RAM - [pill text, Monitor label, detail]
+const STANDBY = {
+  suspended: ["Suspended · RAM free", "Suspended: RAM given back", "the GPU keeps the model; the next request resumes it in seconds"],
+  hibernated: ["Hibernated · RAM and VRAM free", "Hibernated", "conversations saved; the next request resumes it"],
+  unloaded: ["Unloaded", "Unloaded", "the next request loads it"],
+};
+
 function setPill(state, text) {
   $("pill").dataset.state = state === "error" ? "queued" : state;
   $("pill-text").textContent = text;
@@ -189,6 +196,13 @@ function render(m) {
     setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
   } else if (live.state === "generating") {
     setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+  } else if (live.state === "loading" || live.state === "resuming") {
+    setPill("reading", live.state === "resuming" ? "Resuming…" : "Loading model…");
+  } else if (STANDBY[live.state] && live.held_by && live.held_by.length) {
+    // local: a running job holds it on a lease - nothing loads the model back until the job ends
+    setPill("queued", `Locked · ${live.state} (job ${live.held_by.map((l) => l.cmd || l.id).join(", ")})`);
+  } else if (STANDBY[live.state]) {
+    setPill("idle", STANDBY[live.state][0]);
   } else {
     setPill("idle", "Idle");
   }
@@ -240,9 +254,41 @@ function renderTotals(t) {
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
+// local: who holds the model (a live lease): its command, folder and agent session
+function holdersText(hs) {
+  return (hs || []).map((x) => {
+    const who = x.session ? ` · ${x.session.agent} session "${x.session.id}"` : "";
+    return `${x.cmd || "?"} in ${x.cwd || "?"} · ${Math.round((x.age_s || 0) / 60)} min${who}`;
+  }).join("  |  ");
+}
+
+// local: the requests in Strata now - state, how long, who sent them (an opencode session, a subagent and its task)
+function requestLine(r) {
+  const mins = Math.floor((r.waiting_s || 0) / 60);
+  const t = mins ? `${r.state} (${mins} min)` : r.state;
+  if (!r.session) return `${t} - from ${r.client || "a client"}`;
+  if (r.parent) {
+    return `${t} - subagent${r.subagent ? " " + r.subagent : ""} of "${r.parent_title || r.parent}"` +
+      (r.task ? ` - task: ${r.task}` : "");
+  }
+  return `${t} - opencode session "${r.title || r.session}"`;
+}
+
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+  // local: the requests row (shown while any request is in Strata)
+  const reqs = live.requests || [];
+  $("state-requests").hidden = !reqs.length;
+  if (reqs.length) $("state-requests-text").textContent = `Requests (${reqs.length}):\n` + reqs.map(requestLine).join("\n");
+  // local: the holders row (shown only while a job holds the model on a lease)
+  const held = STANDBY[live.state] && live.held_by && live.held_by.length;
+  $("state-holders").hidden = !held;
+  if (held) {
+    $("state-holders-text").textContent = holdersText(live.held_by);
+    $("state-stop").hidden = false;
+  }
   // model state
-  const on = live.queued > 0 ? "queued" : live.state;
+  const on = live.queued > 0 ? "queued" : live.state === "resuming" ? "loading" : live.state;
+  const busy = live.state === "reading" || live.state === "generating";
   for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
   const prog = $("state-progress");
   let label = "Waiting for a request", detail = "", pct = 0;
@@ -260,6 +306,19 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
     detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+  } else if (live.state === "loading" || live.state === "resuming") {
+    label = live.state === "resuming" ? "Resuming" : "Loading the model";
+    prog.dataset.tone = "info";
+    detail = "a request is waiting for it";
+  } else if (STANDBY[live.state] && live.held_by && live.held_by.length) {
+    prog.dataset.tone = "info";
+    label = `Locked · ${live.state}`;   // the same order as the pill: "Locked · unloaded"
+    detail = `locked by a running job (${live.held_by.map((l) => l.cmd || l.id).join(", ")}): requests wait until it ` +
+      "ends, then the model resumes by itself";
+  } else if (STANDBY[live.state]) {
+    delete prog.dataset.tone;
+    label = STANDBY[live.state][1];
+    detail = STANDBY[live.state][2];
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
@@ -272,7 +331,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
   setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
             live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+  const prefill = busy ? live.prefill_tok_s_mean
                 : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
   setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
             live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
@@ -312,7 +371,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // context fill: the running request, else the last one
   const ctx = eng.max_context || 0;
   let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
+  if (busy) used = (live.prompt_tokens || 0) + (live.generated || 0);
   else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
   const frac = ctx ? Math.min(1, used / ctx) : 0;
   $("ctx-fill").setAttribute("stroke-dasharray", `${(235.6 * frac).toFixed(1)} 314.2`);
@@ -401,6 +460,21 @@ document.addEventListener("click", (e) => {
   if (b) copyText(b.dataset.copy, b);
 });
 $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (lastMetrics) render(lastMetrics); });
+// local: end the job(s) holding the model (POST /lease/stop {"all": true}); each job ends at its wrapper's next
+// renewal (within ~10 s), and the agent that ran it is told not to run it again
+$("state-stop").addEventListener("click", async () => {
+  const text = $("state-holders-text").textContent;
+  if (!confirm(`End the job(s) holding the model?\n\n${text}`)) return;
+  const btn = $("state-stop");
+  btn.disabled = true;
+  try {
+    const r = await fetch("lease/stop", {method: "POST", headers: headers(true), body: JSON.stringify({all: true})});
+    const b = await r.json().catch(() => ({}));
+    if (!r.ok) alert(`Stop failed: ${(b.error && b.error.message) || r.status}`);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // ------------------------------------------------------------------ MCP servers (GET /mcp)
 // Tools from the MCP servers in the run config: the chat offers them to the model (opt-in per request,
@@ -566,10 +640,67 @@ let messages = store.get("chat", []);
 let attachments = [];                 // {name, url}
 let busy = null;                      // {controller, msg}
 
-function saveChat() {
-  store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
-                                           files: (m.files || []).map((f) => ({name: f.name}))})));
+const savedForm = (list) => list.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
+                                                 files: (m.files || []).map((f) => ({name: f.name}))}));
+function saveChat(archive = false) {
+  store.set("chat", savedForm(messages));
+  if (shared.on) pushShared(archive);
 }
+
+// local: the chat shared by every device (the server's chat_dir, serve/chat_store.py).  The page loads it at the
+// start, saves to it after every change, and while idle looks every few seconds for a newer version from another
+// device.  An answer running for any device is followed live (resumeRun).  A save made from an older version is
+// refused; the page then takes the server's chat (or, while it is writing an answer itself, saves over it).
+const shared = {on: false, version: 0, timer: 0, saving: false, again: false, archive: false};
+function takeShared(st) {
+  shared.version = st.version;
+  messages = st.messages || [];
+  store.set("chat", savedForm(messages));
+  renderChat();
+  resumeRun();
+}
+async function loadSharedChat() {
+  try {
+    const r = await fetch("v1/chat-store", {headers: headers()});
+    if (!r.ok) return;                                  // no chat_dir (404): the chat stays in this browser
+    const st = await r.json();
+    shared.on = true;
+    if (st.version > 0) takeShared(st);
+    else if (messages.length) pushShared();            // the first device to connect brings its chat
+  } catch (e) { /* offline: this browser's copy */ }
+}
+function pushShared(archive = false) {
+  shared.archive = shared.archive || archive;
+  clearTimeout(shared.timer);
+  shared.timer = setTimeout(async () => {
+    if (shared.saving) { shared.again = true; return; }
+    shared.saving = true;
+    const body = {version: shared.version, messages: savedForm(messages), archive: shared.archive};
+    shared.archive = false;
+    try {
+      const r = await fetch("v1/chat-store", {method: "POST", headers: headers(true), body: JSON.stringify(body)});
+      const st = await r.json();
+      if (r.ok) shared.version = st.version;
+      else if (r.status === 409) {
+        if (busy) { shared.version = st.version; shared.again = true; }   // writing an answer here: this one wins
+        else { takeShared(st); toast("info", "Updated", "The chat changed on another device.", 4000); }
+      }
+    } catch (e) { /* offline: saved in this browser; the next save tries again */ }
+    shared.saving = false;
+    if (shared.again) { shared.again = false; pushShared(); }
+  }, 300);
+}
+async function pollShared() {
+  if (!shared.on || busy || shared.saving || document.visibilityState !== "visible") return;
+  try {
+    const r = await fetch(`v1/chat-store?v=${shared.version}`, {headers: headers()});
+    if (!r.ok) return;
+    const st = await r.json();
+    if (st.messages && st.version !== shared.version && !busy && !shared.saving) takeShared(st);
+  } catch (e) { /* offline */ }
+}
+setInterval(pollShared, 4000);
+document.addEventListener("visibilitychange", pollShared);     // back to this tab (a phone unlocked): look at once
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
 function msgEl(m, i) {
@@ -605,6 +736,8 @@ function msgEl(m, i) {
     const meta = document.createElement("div");
     meta.className = "st-msg__meta";
     meta.textContent = `You · ${timeStr(m.time)}`;
+    meta.insertAdjacentHTML("beforeend", `<button class="st-btn st-btn--icon" data-msg-rewind aria-label="Go back to this question" ` +
+      `title="Go back to this question: it and everything after it are removed, and it goes back in the box to edit or send again">${icon("refresh")}</button>`);
     el.appendChild(meta);
   } else {
     el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
@@ -622,7 +755,7 @@ const TOOL_STATE = {writing: ["st-badge--reading", "Writing"], running: ["st-bad
 function toolHtml(t, k) {
   const [cls, label] = TOOL_STATE[t.state] || ["", t.state];
   const args = t.arguments == null ? "" : JSON.stringify(t.arguments, null, 2);
-  const preview = t.result != null ? t.result : args.replace(/\s+/g, " ");
+  const preview = t.result != null ? t.result : t.state === "running" && t.progress ? t.progress : args.replace(/\s+/g, " ");
   let body = "";
   if (t.open) {
     body = `<div class="tool-call__label">Arguments</div><pre class="tool-call__pre">${esc(args || "(being written)")}</pre>`;
@@ -631,10 +764,14 @@ function toolHtml(t, k) {
               `${t.truncated ? ", cut for the model" : ""}</div><pre class="tool-call__pre">${esc(t.result)}</pre>`;
     }
   }
+  // local: a helper block can be run (again) from here, with its task as written (runHelper)
+  const runnable = t.name === "subagent" && ["skipped", "done", "error"].includes(t.state) && t.arguments && t.arguments.task;
+  const run = runnable ? `<button type="button" class="st-btn st-btn--secondary st-btn--sm" data-tool-run ` +
+    `title="Run this helper now with the task as written; its report fills this block">${t.state === "skipped" ? "Run" : "Run again"}</button>` : "";
   return `<details class="st-collapse tool-call" data-tool="${k}" data-state="${esc(t.state)}"${t.open ? " open" : ""}>` +
     `<summary>${icon("tool", "st-icon st-icon--sm")}<span class="tool-call__name" title="${esc(t.name || "")}">${esc(t.tool || t.name || "tool")}</span>` +
     (t.server ? `<span class="muted small">${esc(t.server)}</span>` : "") +
-    `<span class="tool-call__preview muted">${esc(preview.slice(0, 200))}</span>` +
+    `<span class="tool-call__preview muted">${esc(preview.slice(0, 200))}</span>${run}` +
     `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>`;
 }
@@ -647,6 +784,7 @@ function answerHtml(m) {
     if (at > pos) html += markdown(m.text.slice(pos, at));
     pos = at;
     html += toolHtml(t, k);
+    for (const n of t.notes || []) html += `<div class="tool-note muted">You, while it worked: ${esc(n)}</div>`;
   });
   return html + markdown(m.text.slice(pos));
 }
@@ -658,6 +796,13 @@ function onTool(m, x) {
   if (!t) { t = {id: x.id, name: x.name, at: m.text.length, rat: m.reasoning.length, state: "writing"}; m.tools.push(t); }
   if (x.event === "call") {
     Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
+    if (x.name === "subagent" && x.arguments && x.arguments.label) t.server = String(x.arguments.label);
+  } else if (x.event === "progress") {                 // a helper (mcp.subagents) at work: what it is doing now
+    t.progress = x.text;
+  } else if (x.event === "user_note") {                // queued messages, given to the agent with this result
+    t.result = (t.result || "") + x.text;
+    for (const n of m.queued || []) if (x.notes.includes(n.id)) { n.delivered = true; t.notes = [...(t.notes || []), n.text]; }
+    renderQueued();
   } else if (x.event === "result") {
     Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
@@ -680,11 +825,23 @@ function updateAssistant(el, m, streaming) {
   const bubble = el.querySelector(".st-bubble");
   if (m.error) {
     bubble.innerHTML = `<div class="msg-error"></div>`;
+    bubble._html = null;
     bubble.firstChild.textContent = m.error;
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
+    bubble._html = null;
   } else {
-    bubble.innerHTML = answerHtml(m);
+    // an open tool block is rebuilt with the answer (every streamed piece, a helper's progress): keep where its parts
+    // were scrolled to, and skip the rebuild when nothing changed
+    const html = answerHtml(m);
+    if (html !== bubble._html) {
+      const parts = (root) => [...root.querySelectorAll(".tool-call[open]")].flatMap((tc) =>
+        [...tc.querySelectorAll("pre, .st-collapse__body")].map((x, n) => [`${tc.dataset.tool}/${n}`, x]));
+      const kept = new Map(parts(bubble).filter(([, x]) => x.scrollTop || x.scrollLeft).map(([k, x]) => [k, [x.scrollTop, x.scrollLeft]]));
+      bubble.innerHTML = html;
+      bubble._html = html;
+      if (kept.size) for (const [k, x] of parts(bubble)) if (kept.has(k)) [x.scrollTop, x.scrollLeft] = kept.get(k);
+    }
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
@@ -697,12 +854,61 @@ function renderChat() {
   messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
   scrollDown(true);
 }
-function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
-function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
+// local: go back to an earlier question - it and everything after it leave the chat, and it returns to the box (with its
+// attachments) to be edited or sent again.  The chat before it is unchanged, so the engine reuses it.  Undo restores.
+function rewindTo(i) {
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  const m = messages[i];
+  if (!m || m.role !== "user") return;
+  const backup = messages, backupInput = $("input").value, backupAttach = attachments;
+  messages = messages.slice(0, i);
+  $("input").value = m.text || "";
+  attachments = [...(m.images || []), ...(m.files || [])];
+  renderAttachments();
+  autosize();
+  saveChat();
+  renderChat();
+  $("input").focus();
+  toast("info", "Went back", `${backup.length - i} message${backup.length - i > 1 ? "s" : ""} removed; the question is back in the box.`,
+        8000, {label: "Undo", run: () => { messages = backup; attachments = backupAttach; $("input").value = backupInput;
+                                           renderAttachments(); autosize(); saveChat(); renderChat(); }});
+}
+// local: the chat follows a streaming answer only while the reader is at the bottom.  Scrolling up (wheel, touch, the
+// scrollbar, keys) stops it at once - "near the bottom" (120 px) used to pull a reader one wheel step up back down;
+// scrolling back to the bottom (or sending) starts it again.
+let stickBottom = true, scrollByHand = false;
+function nearBottom(px = 40) { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < px; }
+function scrollDown(force) {
+  if (force) stickBottom = true;
+  if (stickBottom) { const s = $("chat-scroll"); s.scrollTop = s.scrollHeight; }
+}
+{
+  const s = $("chat-scroll"), hand = (on) => () => { scrollByHand = on; };
+  s.addEventListener("wheel", (e) => { if (e.deltaY < 0) stickBottom = false; else if (nearBottom()) stickBottom = true; }, {passive: true});
+  s.addEventListener("touchstart", hand(true), {passive: true});
+  s.addEventListener("touchend", hand(false), {passive: true});
+  s.addEventListener("pointerdown", hand(true));                    // the scrollbar
+  document.addEventListener("pointerup", hand(false));
+  let lastTop = 0;                                                  // moved down to the bottom (wheel, keys, bar): follow
+  s.addEventListener("scroll", () => {
+    if (scrollByHand) stickBottom = nearBottom();
+    else if (s.scrollTop > lastTop && nearBottom()) stickBottom = true;
+    lastTop = s.scrollTop;
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.target.closest && e.target.closest("textarea, input")) return;
+    if (["PageUp", "ArrowUp", "Home"].includes(e.key)) stickBottom = false;
+    else if (e.key === "End") stickBottom = true;
+  });
+}
 
 $("chat").addEventListener("click", (e) => {
   const cc = e.target.closest("[data-code-copy]");
   if (cc) { copyText(cc.closest(".st-code").querySelector("pre").textContent, cc); return; }
+  const tr = e.target.closest("[data-tool-run]");
+  if (tr) { e.preventDefault(); runHelper(+tr.closest(".st-msg").dataset.i, +tr.closest(".tool-call").dataset.tool); return; }
+  const rw = e.target.closest("[data-msg-rewind]");
+  if (rw) { rewindTo(+rw.closest(".st-msg").dataset.i); return; }
   const mc = e.target.closest("[data-msg-copy]");
   if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
   // a tool block: its open state lives in the message (the answer is rebuilt while it streams), so the click sets it
@@ -738,49 +944,190 @@ function apiMessages() {
   }
   return out;
 }
-// An answer that used MCP tools goes back as the model wrote it: per round the text before the calls, the calls and
-// their results (as the model read them), then the rest - so the next question can build on what the tools found.
+// An answer that used MCP tools goes back as the model wrote it: per round its reasoning, the text before the calls,
+// the calls and their results (as the model read them), then the rest - so the next question can build on what the
+// tools found.  local: each part carries its reasoning too, exactly as the server's tool loop gave it to the model
+// (run_with_mcp; the template keeps earlier turns' reasoning, preserve_thinking): the history then matches what the
+// engine holds token for token, and the next question reuses it instead of reading the whole conversation again
+// (measured: a 110K-token research chat re-read 108K tokens, 41.8 s, on every new question).
 function assistantMessages(m) {
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
+  const reasoning = m.reasoning || "";
+  // #458 follow-up: the effort this answer was written with, so the server puts its effort turn back exactly where
+  // the engine saw it (serve/server.py render_prompt, "effort_position": "end"); high/none need no turn
+  const effort = (m.effort === "low" || m.effort === "medium") ? {strata_effort: m.effort} : {};
+  const withReasoning = (msg, r) => {
+    const t = r.trim();
+    if (t) msg.reasoning_content = t;
+    return Object.assign(msg, effort);
+  };
   // #1392: a turn with no answer text (only reasoning, a stop before the first content token, or an error) still goes
   // back as an assistant turn, so the history keeps alternating and a reasoning model sees that it already answered.
   // The server leaves such a turn out of the prompt itself (serve/frontend.py, #843); reasoning_content rides along.
-  if (!ran.length) {
-    const msg = {role: "assistant", content: m.text || ""};
-    if (!m.text && m.reasoning) msg.reasoning_content = m.reasoning;
-    return [msg];
-  }
+  if (!ran.length) return [withReasoning({role: "assistant", content: m.text || ""}, reasoning)];
   const out = [];
-  let pos = 0;
+  let pos = 0, rpos = 0;
   for (const r of [...new Set(ran.map((t) => t.round))]) {
     const calls = ran.filter((t) => t.round === r);
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
-    out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
-              tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
+    const rat = Math.min(Math.max(rpos, calls[0].rat || 0), reasoning.length);
+    out.push(withReasoning({role: "assistant", content: m.text.slice(pos, at).trim(),
+              tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))},
+             reasoning.slice(rpos, rat)));
     for (const t of calls) out.push({role: "tool", tool_call_id: t.id, content: t.result});
     pos = at;
+    rpos = rat;
   }
-  const rest = m.text.slice(pos).trim();
-  if (rest) out.push({role: "assistant", content: rest});
+  const rest = m.text.slice(pos).trim(), restReasoning = reasoning.slice(rpos);
+  if (rest || restReasoning.trim()) out.push(withReasoning({role: "assistant", content: rest}, restReasoning));
   return out;
+}
+
+// local: Compact - fit a long chat back into the context window (the model's own limit, max_context).
+// 1. No model call: every tool result before the latest question shrinks to its first TOOL_KEEP characters and a note
+//    (the answers built on them stay whole).
+// 2. Only if the chat is still above COMPACT_FILL of the window: the turns before the last COMPACT_KEEP questions are
+//    summarized by the model into one message.
+// Undo puts the chat back as it was.  The next question reads the shortened chat once; reuse works again after that.
+const TOOL_KEEP = 300, COMPACT_FILL = 0.8, COMPACT_KEEP = 2, WARN_FILL = 0.85;
+let promptScale = {tokens: 0, chars: 0};               // the last prompt's size: tokens per character of its messages
+const msgChars = (msgs) => JSON.stringify(msgs, (k, v) => (k === "image_url" ? "" : v)).length;   // pictures aside
+function noteScale(tokens, msgs) {
+  const chars = msgChars(msgs);
+  if (tokens > 0 && chars > 0) promptScale = {tokens, chars};
+}
+function estimateTokens(msgs) {
+  const chars = msgChars(msgs);
+  return Math.round(chars * (promptScale.chars ? promptScale.tokens / promptScale.chars : 1 / 3.5));
+}
+function compactOffer(title, text) {
+  toast("warn", title, text, 12000, {label: "Compact", run: () => compactChat()});
+}
+async function compactChat() {
+  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (!messages.length) { toast("info", "Nothing to compact"); return; }
+  const backup = JSON.parse(JSON.stringify(messages));
+  const undo = {label: "Undo", run: () => { messages = backup; saveChat(); renderChat(); }};
+  const limit = health.max_context || 0;
+  // a question whose answer was refused for length goes back into the box, to be sent again after compacting
+  const last = messages[messages.length - 1];
+  let resend = "";
+  if (last && last.role === "assistant" && !last.text && last.error && /exceeds the context/.test(last.error)) {
+    messages.pop();
+    const q = messages[messages.length - 1];
+    if (q && q.role === "user") { resend = q.text || ""; messages.pop(); }
+  }
+  const before = estimateTokens(apiMessages());
+  let lastUser = -1;
+  messages.forEach((m, i) => { if (m.role === "user") lastUser = i; });
+  if (lastUser < 0) lastUser = messages.length;
+  let shrunk = 0;
+  messages.forEach((m, i) => {
+    if (m.role !== "assistant" || i >= lastUser) return;
+    for (const t of m.tools || []) {
+      if (typeof t.result === "string" && t.result.length > TOOL_KEEP + 120 && !t.compacted) {
+        t.result = `${t.result.slice(0, TOOL_KEEP)}\n[the rest removed to save context: ${fmt(t.result.length)} characters]`;
+        t.compacted = true;
+        shrunk++;
+      }
+    }
+  });
+  let after = estimateTokens(apiMessages());
+  let summarized = false;
+  if (limit && after > COMPACT_FILL * limit) {
+    // 2. summarize the older turns: everything before the last COMPACT_KEEP questions - or fewer, down to the last
+    //    one, when the recent turns alone would take more than half the window
+    const users = messages.map((m, i) => (m.role === "user" ? i : -1)).filter((i) => i >= 0);
+    const tailTokens = (from) => { const all = messages; messages = all.slice(from); const n = estimateTokens(apiMessages()); messages = all; return n; };
+    let split = 0;
+    for (let keep = Math.min(COMPACT_KEEP, users.length - 1); keep >= 1; keep--) {
+      split = users[users.length - keep];
+      if (tailTokens(split) <= 0.5 * limit) break;
+    }
+    if (split > 0) {
+      const older = messages.slice(0, split);
+      const keep = messages;
+      messages = older;
+      const history = apiMessages().map((x) => (x.role === "assistant" ? {...x, reasoning_content: undefined} : x));
+      messages = keep;
+      history.push({role: "user", content: "Summarize this conversation so far, so it can be continued from the " +
+        "summary alone: the goal, what was found (keep the key numbers, names, sources and URLs), the decisions made, " +
+        "and what is still open. Be complete but concise. Answer with the summary only."});
+      toast("info", "Compacting", "Summarizing the older turns ...", 8000);
+      try {
+        const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(
+          {model: health.model, messages: history, stream: false, max_tokens: 6000, reasoning_effort: "low"})});
+        const j = await r.json();
+        if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+        const summary = ((j.choices && j.choices[0] && j.choices[0].message) || {}).content || "";
+        if (!summary.trim()) throw new Error("the summary came back empty");
+        messages = [{role: "user", text: "(The earlier part of this chat, summarized to fit the context window.)",
+                     images: [], files: [], time: older[0].time || Date.now()},
+                    {role: "assistant", text: summary.trim(), reasoning: "", time: Date.now(), compactSummary: true},
+                    ...messages.slice(split)];
+        summarized = true;
+        after = estimateTokens(apiMessages());
+      } catch (e) {
+        toast("error", "The summary failed", `${e.message || e}. The tool results were still shortened.`, 8000, undo);
+      }
+    }
+  }
+  if (resend) { $("input").value = resend; autosize(); }
+  saveChat();
+  renderChat();
+  const what = summarized ? `older turns summarized${shrunk ? `, ${shrunk} tool results shortened` : ""}`
+                          : shrunk ? `${shrunk} tool results shortened` : "nothing to shorten";
+  toast(after > COMPACT_FILL * (limit || Infinity) ? "warn" : "info", "Compacted",
+        `~${fmt(before)} -> ~${fmt(after)} tokens (${what}).${resend ? " Your last message is back in the box." : ""}`,
+        10000, undo);
 }
 
 function setBusy(on) {
   $("stop-btn").hidden = !on;
-  $("send-btn").disabled = on;
-  $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
+  $("send-btn").disabled = false;
+  $("composer-hint").textContent = on ? "Enter: queue a message for the agent" : "Shift+Enter: new line";
+}
+// local: a message written while the answer runs is queued: the server gives it to the agent with its next tool
+// results (POST v1/runs/<id>/message); what is still queued when the answer ends goes out as the next message.
+function renderQueued() {
+  const m = busy && busy.msg, box = $("queued");
+  const waiting = m ? (m.queued || []).filter((n) => !n.delivered) : [];
+  box.hidden = !waiting.length;
+  box.innerHTML = "";
+  for (const n of waiting) {
+    const c = document.createElement("span");
+    c.className = "chip";
+    c.title = "Queued: the agent reads it with its next tool results, or it is sent when the answer ends";
+    c.textContent = `Queued: ${n.text}`;
+    box.appendChild(c);
+  }
+}
+function queueMessage(text) {
+  const m = busy.msg;
+  if (attachments.length) { toast("warn", "Attachments wait", "Files and pictures can be sent once the answer ends."); return; }
+  const note = {id: `n-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, text};
+  m.queued = [...(m.queued || []), note];
+  $("input").value = "";
+  autosize();
+  renderQueued();
+  saveChat();
+  if (m.run) fetch(`v1/runs/${encodeURIComponent(m.run)}/message`, {method: "POST", headers: headers(true),
+                   body: JSON.stringify({id: note.id, text})}).catch(() => {});   // refused: it is sent at the end
 }
 
 async function send() {
   const text = $("input").value.trim();
-  if ((!text && !attachments.length) || busy) return;
+  if (busy && busy.helper) { toast("info", "A helper is running", "Send once it is done (or stop it)."); return; }
+  if (busy) { if (text) queueMessage(text); return; }
+  if (!text && !attachments.length) return;
+  if (text === "/compact" && !attachments.length) { $("input").value = ""; autosize(); compactChat(); return; }
   messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
                  files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
   attachments = [];
   renderAttachments();
   $("input").value = "";
   autosize();
-  const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
+  const m = {role: "assistant", text: "", reasoning: "", time: Date.now(), effort: settings.thinking};
   messages.push(m);
   renderChat();
   const el = $("chat").lastElementChild;
@@ -799,16 +1146,100 @@ async function send() {
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
+  if (body.strata_mcp) {
+    // local: the answer outlives the page - a reload reattaches to it (resumeRun) instead of stopping it
+    m.run = `run-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+    body.strata_run = m.run;
+    saveChat();
+  }
+  await streamInto(m, el, controller, body, (signal) => fetch("v1/chat/completions",
+    {method: "POST", headers: headers(true), body: JSON.stringify(body), signal}));
+}
 
+// local: Run on a helper block - the server runs that helper with the task as written (POST v1/subagent) and its report
+// fills the block, as if the model's call had run: the next question reads it, and nothing is written out twice.
+async function runHelper(i, k) {
+  if (busy) { toast("warn", "Still writing", "Wait for the answer, or stop it."); return; }
+  const m = messages[i], t = m && m.tools && m.tools[k];
+  if (!t || !t.arguments || !t.arguments.task) return;
+  const el = $("chat").querySelector(`.st-msg[data-i="${i}"]`);
+  const before = {...t};
+  const controller = new AbortController();
+  busy = {controller, msg: m, helper: true};
+  setBusy(true);
+  Object.assign(t, {state: "running", progress: "starting", result: null, ms: null});
+  if (t.round == null) t.round = Math.max(0, ...(m.tools || []).map((x) => x.round || 0)) + 1;
+  const paint = () => { if (el) updateAssistant(el, m, false); };
+  paint();
+  try {
+    const r = await fetch("v1/subagent", {method: "POST", headers: headers(true), signal: controller.signal,
+      body: JSON.stringify({task: t.arguments.task, label: t.arguments.label, reasoning_effort: settings.thinking})});
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
+      throw new Error(msg);
+    }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "", got = false;
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data: {")) continue;
+        const j = JSON.parse(line.slice(6));
+        if (j.error) throw new Error(j.error.message || "the helper failed");
+        const x = j.strata_mcp || {};
+        if (x.event === "progress") t.progress = x.text;
+        else if (x.event === "result") {
+          Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, state: x.ok ? "done" : "error"});
+          got = true;
+        }
+        paint();
+      }
+    }
+    if (!got) throw new Error("the helper ended without a report");
+  } catch (e) {
+    if (e.name === "AbortError") Object.assign(t, before);            // stopped: the block as it was
+    else Object.assign(t, {state: "error", result: `error: ${e.message || e}`, ok: false});
+    if (e.name !== "AbortError") toast("error", "The helper failed", e.message || String(e), 6000);
+  }
+  busy = null;
+  setBusy(false);
+  paint();
+  saveChat();
+}
+
+// After a reload: the last answer was still being written - stream it again from the server, from its start.
+function resumeRun() {
+  const m = messages[messages.length - 1];
+  if (!m || m.role !== "assistant" || !m.run || busy) return;
+  Object.assign(m, {text: "", reasoning: "", tools: [], meta: ""});
+  for (const n of m.queued || []) n.delivered = false;           // the replay says again which ones it read
+  for (const k of ["error", "thinkSecs", "limit", "stopped"]) delete m[k];
+  renderChat();
+  const el = $("chat").lastElementChild;
+  const controller = new AbortController();
+  busy = {controller, msg: m};
+  setBusy(true);
+  renderQueued();
+  streamInto(m, el, controller, null, (signal) => fetch(`v1/runs/${encodeURIComponent(m.run)}`, {headers: headers(), signal}));
+}
+
+// One answer's stream (a new request, or a run reattached after a reload: body null) into message m.
+async function streamInto(m, el, controller, body, open) {
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
   try {
-    const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
-                                                   signal: controller.signal});
+    const r = await open(controller.signal);
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
       if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
+      if (r.status === 404 && !body) msg = "This answer was lost: the server restarted, or it ended over an hour ago.";
       throw new Error(msg);
     }
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -848,13 +1279,23 @@ async function send() {
     }
   } catch (e) {
     if (e.name === "AbortError") m.stopped = true;
-    else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
+    else if (/exceeds the context/.test(e.message || "")) {
+      m.error = e.message;
+      compactOffer("The chat is too long", `${m.error}. Compact shortens the older turns; your message goes back in the box.`);
+    } else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
+  }
+  if (usage && usage.prompt_tokens) {
+    if (body) noteScale(usage.prompt_tokens, body.messages);
+    const limit = health.max_context || 0, used = usage.prompt_tokens + (usage.completion_tokens || 0);
+    if (limit && used > WARN_FILL * limit) {
+      compactOffer("The chat is nearly full", `${fmt(used)} of ${fmt(limit)} tokens used. Compact it before the next question.`);
+    }
   }
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
   if (n && firstAt) {
-    const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
+    const secs = (performance.now() - firstAt) / 1000;          // a reattached run streams its start at once: no rate
+    m.meta = `${fmt(n)} tokens${secs > 0.25 && body ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
              (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
   } else if (m.stopped) {
     m.meta = "Stopped";
@@ -863,28 +1304,43 @@ async function send() {
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
   if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`;
   if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
+  delete m.run;                                    // ended (or stopped): nothing to reattach to after a reload
+  const left = (m.queued || []).filter((n) => !n.delivered).map((n) => n.text);
+  delete m.queued;
   busy = null;
   setBusy(false);
+  renderQueued();
   if (frame) cancelAnimationFrame(frame);
   updateAssistant(el, m, false);
   saveChat();
   scrollDown();
+  if (left.length) {                               // queued too late for this answer: the next message
+    $("input").value = left.join("\n\n");
+    autosize();
+    if (!m.stopped && !m.error) send();
+  }
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
-$("stop-btn").onclick = () => { if (busy) busy.controller.abort(); };
+$("stop-btn").onclick = () => {
+  if (!busy) return;
+  // a run outlives the page's connection: stop it on the server too
+  if (busy.msg.run) fetch(`v1/runs/${encodeURIComponent(busy.msg.run)}/cancel`, {method: "POST", headers: headers(true), body: "{}"}).catch(() => {});
+  busy.controller.abort();
+};
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
 });
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
 $("input").addEventListener("input", autosize);
 
+$("compact-btn").onclick = () => compactChat();
 $("new-btn").onclick = () => {
   if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
   if (!messages.length) return;
   const backup = messages;
   messages = [];
-  saveChat();
+  saveChat(true);                                     // the shared chat it replaces is archived on the server
   renderChat();
   toast("info", "New chat", "The last one was cleared.", 6000, {label: "Undo", run: () => { messages = backup; saveChat(); renderChat(); }});
 };
@@ -909,8 +1365,40 @@ function isTextFile(f) {
   return f.type.startsWith("text/") || /json|xml|javascript|yaml|toml|x-sh|x-python/.test(f.type) ||
          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
 }
+// PDF / Word / Excel / PowerPoint: the server turns them into text (POST /convert, MarkItDown), attached like a text file
+const DOC_EXT = /\.(pdf|docx|xlsx|pptx)$/i;
+const MAX_DOC_FILE = 50 * 1024 * 1024;
+const MAX_DOC_TEXT = 1024 * 1024;
+async function addDocument(f) {
+  if (f.size > MAX_DOC_FILE) { toast("warn", "File too large", `${f.name} is over 50 MB.`); return; }
+  toast("info", "Reading document", f.name);
+  try {
+    const data = await new Promise((ok, fail) => {
+      const r = new FileReader();
+      r.onload = () => ok(r.result);
+      r.onerror = () => fail(r.error || new Error("could not read the file"));
+      r.readAsDataURL(f);
+    });
+    const r = await fetch("convert", {method: "POST", headers: headers(true), body: JSON.stringify({name: f.name, data})});
+    let j = {};
+    try { j = await r.json(); } catch (e) { /* not json */ }
+    if (!r.ok) throw new Error((j.error && j.error.message) || `HTTP ${r.status}`);
+    const text = String(j.text || "");
+    if (text.trim().length < 20) {
+      toast("warn", "No text found", `${f.name}: nothing could be read - a scan or a picture has no text layer.`, 8000);
+      return;
+    }
+    if (text.length > MAX_DOC_TEXT) { toast("warn", "Document too long", `${f.name} is over 1 MB of text.`, 8000); return; }
+    attachments.push({kind: "file", name: f.name, text});
+    renderAttachments();
+    toast("success", "Document attached", `${f.name}: ${text.length.toLocaleString()} characters of text.`);
+  } catch (e) {
+    toast("error", "Could not read document", `${f.name}: ${e.message}`, 8000);
+  }
+}
 function addFiles(files) {
   for (const f of files) {
+    if (DOC_EXT.test(f.name)) { addDocument(f); continue; }
     if (f.type.startsWith("image/")) {
       if (!health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
       if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
@@ -919,7 +1407,7 @@ function addFiles(files) {
       r.readAsDataURL(f);
       continue;
     }
-    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${health.images ? " or pictures" : ""}.`); continue; }
+    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data), PDF, Word, Excel or PowerPoint${health.images ? " or pictures" : ""}.`); continue; }
     if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
     const r = new FileReader();
     r.onload = () => {
@@ -1081,7 +1569,7 @@ setBusy(false);
 renderChat();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-loadHealth().then(loadMcp).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+loadHealth().then(loadMcp).then(loadSharedChat).then(() => { resumeRun(); if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();
 

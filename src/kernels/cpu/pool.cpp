@@ -386,6 +386,20 @@ namespace {
 bool pin_this_thread(int core, [[maybe_unused]] int worker = -1) {
     if (core < 0) return false;
 #if defined(_WIN32)
+    // A CPU Set (SetThreadSelectedCpuSets) rather than a hard group affinity.  On a Core Ultra 9 285K with Windows 11
+    // 26300 either call can take seconds for some cores (up to 7.3 s measured, cores 13/22/23), and while a HARD
+    // affinity change is in flight every thread creation in the process waits - the next worker's, the CUDA
+    // driver's, the loaders' - which stalled a start by 0.5-5.8 s in most starts; a CPU Set change holds up only the
+    // worker it pins, which is idle until the first token anyway.  Measured: decode 97.5 vs 98.4 tok/s, a 48K
+    // prompt 2447 vs 2448 tok/s (3 + 3 server starts, ranges overlap).  STRATA_POOL_PIN=hard keeps the hard affinity.
+    static const bool sets = [] { const char* v = std::getenv("STRATA_POOL_PIN"); return !(v != nullptr && std::string(v) == "hard"); }();
+    if (sets) {
+        ULONG id = 0;
+        if (detail::cpu_set_for_core(core, id) && SetThreadSelectedCpuSets(GetCurrentThread(), &id, 1)) return true;
+        std::fprintf(stderr, "strata cpu pool: CPU Set for worker %d (CPU %d) failed: %lu; previous affinity kept\n",
+                     worker, core, (unsigned long) GetLastError());
+        return false;
+    }
     return detail::set_thread_group_affinity(core, worker);
 #else
     const int error = detail::pin_thread_to_cpu(core);

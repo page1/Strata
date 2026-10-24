@@ -49,7 +49,8 @@ def main():
         sys.exit(1)
     a = sys.argv
     model = a[a.index("--model") + 1].lower()
-    cfg = {"exe": sys.executable, "args": ["--max-context", a[a.index("--context") + 1]], "port": 8080,
+    cfg = {"exe": sys.executable, "args": ["--max-context", a[a.index("--context") + 1]],
+           "port": int((root / "setup-port").read_text()),
            "model_name": "qwen3.8-flash-next-" + model, "log": str(root / f"strata-{model}.log")}
     (root / f"strata-{model}.json").write_text(json.dumps(cfg))
     print("All set.", flush=True)
@@ -67,6 +68,7 @@ a = sys.argv
 port = int(a[a.index("--port") + 1])
 cfg = json.loads(Path(a[a.index("--config") + 1]).read_text())
 root = Path(__file__).resolve().parent.parent
+(root / "server.pid").write_text(str(os.getpid()))   # the real server process (a child of a launcher on Windows)
 print("loading the model (fake) ...", flush=True)
 if cfg.get("crash"):
     print("engine failed: out of memory (fake)", flush=True)
@@ -164,8 +166,15 @@ class FakeRoot(unittest.TestCase):
         self.strata.disk_free = lambda p: 1000.0
         self.tools = M.Tools(self.strata)
         self.extra = []
+        # The tool always also looks at DEFAULT_PORT (8080, where a Strata installed on this PC listens). Point it at a
+        # free port of the test's own, so the tests never probe, or unload, a real Strata running on 8080.
+        self.default_port = free_port()
+        self._default_port_patch = mock.patch.object(M, "DEFAULT_PORT", self.default_port)
+        self._default_port_patch.start()
+        (self.root / "setup-port").write_text(str(self.default_port))
 
     def tearDown(self):
+        self._default_port_patch.stop()
         for p in self.extra:
             if p.poll() is None:
                 p.kill()
@@ -203,8 +212,8 @@ class FakeRoot(unittest.TestCase):
         res = r["result"]
         return json.loads(res["content"][0]["text"]), res["isError"]
 
-    def write_config(self, tag="q2_0", port=8080, **extra):
-        cfg = {"exe": sys.executable, "args": ["--max-context", "32768"], "port": port,
+    def write_config(self, tag="q2_0", port=None, **extra):
+        cfg = {"exe": sys.executable, "args": ["--max-context", "32768"], "port": port or self.default_port,
                "model_name": f"qwen3.8-flash-next-{tag}", "log": str(self.root / f"strata-{tag}.log"), **extra}
         (self.root / f"strata-{tag}.json").write_text(json.dumps(cfg))
         (self.root / f"strata-{tag}.log").write_text("engine line 1\nengine line 2\n")
@@ -234,6 +243,7 @@ class Protocol(FakeRoot):
         self.assertEqual(init["serverInfo"]["name"], "strata")
         names = [t["name"] for t in r[2]["result"]["tools"]]
         self.assertEqual(names, ["strata_status", "strata_models", "strata_install", "strata_start", "strata_stop",
+                                 "strata_suspend", "strata_resume",
                                  "strata_logs", "strata_benchmark", "strata_connect_info"])
         for t in r[2]["result"]["tools"]:
             self.assertEqual(t["inputSchema"]["type"], "object")
@@ -272,7 +282,7 @@ class Protocol(FakeRoot):
                            timeout=60, env=dict(os.environ))
         lines = [json.loads(x) for x in p.stdout.splitlines()]
         self.assertEqual(sorted(m["id"] for m in lines), [1, 2, 3])
-        self.assertEqual(len(next(m for m in lines if m["id"] == 2)["result"]["tools"]), 8)
+        self.assertEqual(len(next(m for m in lines if m["id"] == 2)["result"]["tools"]), 10)
         self.assertIn("ready", p.stderr)
 
     def test_not_a_strata_folder(self):
@@ -463,6 +473,25 @@ class StartStop(FakeRoot):
         self.assertEqual(st["running"], [])
         res, _ = self.call("strata_stop", {})
         self.assertEqual(res["summary"], "Strata is not running")
+
+    def test_stop_ends_the_real_server(self):
+        # On Windows the venv's python.exe is a launcher: the server is its child. Stopping must end the server itself,
+        # not only the launcher, so that nothing still answers on the port or holds the GPU afterwards.
+        port = free_port()
+        self.write_config("q2_0", port=port, delay=1.5)
+        res, err = self.call("strata_start", {"wait_seconds": 30})
+        self.assertFalse(err, res)
+        self.assertTrue(wait_for(lambda: (self.root / "server.pid").exists(), 30))
+        server = int((self.root / "server.pid").read_text())
+        ident = M.proc_identity(server)
+        self.assertIsNotNone(ident)
+        res, err = self.call("strata_stop", {})
+        self.assertFalse(err, res)
+        self.assertIn("Strata stopped", res["summary"])
+        self.assertFalse(M.proc_alive(server, ident), "the server process is still alive after strata_stop")
+        self.assertIsNone(self.strata.probe(port, deep=False), "something still answers on the server's port")
+        st, _ = self.call("strata_status", {"hardware": False})
+        self.assertEqual(st["running"], [])
 
     def test_start_reports_a_crash(self):
         self.write_config("q2_0", port=free_port(), crash=True)

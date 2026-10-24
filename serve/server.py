@@ -35,6 +35,7 @@ import json
 import math
 import os
 import queue
+import io
 import re
 import select
 import signal
@@ -47,6 +48,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import types
 import uuid
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -134,6 +136,7 @@ def write_temporary(path: Path, parts: list) -> None:
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
+ASSISTANT_TURN = "<|im_start|>assistant\n"     # where a template starts an assistant turn (see _effort_turns_back)
 EFFORT_TEXT = {"low": "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the "
                       "conclusion without unnecessary elaboration.",
                "medium": "Reasoning effort is set to medium. Think as much as the task needs, without unnecessary "
@@ -745,6 +748,7 @@ class StrataEngine:
     """
     silence_s = ENGINE_SILENCE_S         # #481: main() sets the config's engine_silence_s (survives restart())
     silent_note = None                   # #481: why the server ended a silent engine (death_note says it)
+    detach_console = False               # local "save_on_close" (Windows): main() sets it before the first start
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
@@ -815,7 +819,14 @@ class StrataEngine:
         pin = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
+        # --conversation-disk-persist on|exit-only: at QUIT the engine first writes its conversations to the disk (GBs)
+        persist = args[args.index("--conversation-disk-persist") + 1] if "--conversation-disk-persist" in args else "off"
+        self.quit_s = 20 if persist == "off" else 300
         spawned_at = time.monotonic()
+        if os.name == "nt" and StrataEngine.detach_console:
+            # local "save_on_close": the engine gets no console, so closing the window does not end it with the server
+            # (serve/winclose.py); Ctrl+C then reaches only the server, whose stop sends QUIT
+            pin["creationflags"] = subprocess.CREATE_NO_WINDOW
         self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
         contain(self.proc)                               # ends with the server, however it ends (Windows)
@@ -840,6 +851,10 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+            if line.startswith("HIBERNATE "):        # hibernate/resume: the restore report, before READY
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    self.info["hibernate_" + k] = int(v) if v.isdigit() else v
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -2040,14 +2055,59 @@ class StrataEngine:
         that never ends is still ended."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        return self._session_exchange(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}",
+                                      "SAVED" if action == "save" else "RESTORED", f"session {action}")
+
+    def hibernate(self, directory: str) -> dict:
+        """Hibernate/resume: `HIBERNATE <dir>` between requests (the caller holds the service FIFO) - the engine parks
+        the live conversation, writes every parked one to `dir` as a session file and then `dir/hibernate.txt` (the
+        latch), and answers `HIBERNATED <n> <bytes> <ms>`.  Same exchange as SAVE (session_file): SESSION / SWAIT keep
+        the wait alive while the files move, SERR is SessionRefused (the engine keeps running, nothing was saved),
+        anything out of step ends the engine.  -> {"saved", "bytes", "ms"}."""
+        if any(c in directory for c in "\r\n\0"):
+            raise ValueError("invalid hibernate folder")
+        r = self._session_exchange(f"HIBERNATE {directory}", "HIBERNATED", "hibernate")
+        return {"saved": r["tokens"], "bytes": r["bytes"], "ms": r["ms"], **({"live": r["live"]} if "live" in r else {})}
+
+    def release(self, directory: str) -> dict:
+        """Partial hibernate: `RELEASE <dir>` - the engine writes the parked conversations as HIBERNATE does (not the
+        current one, which stays on the GPU), drops them from RAM and gives the expert arena's RAM back, staying up
+        with its VRAM: `RELEASED <n> <bytes> <ms> freed=<bytes>`.  SERR is SessionRefused (nothing changed).
+        -> {"saved", "bytes", "ms", "freed"}."""
+        if any(c in directory for c in "\r\n\0"):
+            raise ValueError("invalid hibernate folder")
+        r = self._session_exchange(f"RELEASE {directory}", "RELEASED", "release")
+        self.released = True
+        return {"saved": r["tokens"], "bytes": r["bytes"], "ms": r["ms"], "freed": r.get("freed")}
+
+    def acquire(self, directory: str) -> dict:
+        """Partial hibernate's resume: `ACQUIRE <dir>` - the engine takes the arena's RAM again, reads the experts
+        and re-parks the folder's conversations: `ACQUIRED restored=N of=M bytes=B status=S ms=T`.  FATAL (the arena
+        could not be taken again) is EngineDied: the engine has ended. -> {"restored", "of", "bytes", "status", "ms"}."""
+        if any(c in directory for c in "\r\n\0"):
+            raise ValueError("invalid hibernate folder")
+        r = self._session_exchange(f"ACQUIRE {directory}", "ACQUIRED", "resume")
+        self.released = False
+        return r
+
+    def set_hibernate_arg(self, directory: str | None) -> None:
+        """Put (or clear) `--hibernate-dir <dir>` in the spawn args, so the next start re-parks the folder."""
+        args = self.spawn[1]
+        while "--hibernate-dir" in args:
+            i = args.index("--hibernate-dir")
+            del args[i:i + 2]
+        if directory:
+            args += ["--hibernate-dir", str(directory)]
+
+    def _session_exchange(self, command: str, want: str, what: str) -> dict:
+        """The exchange behind session_file and hibernate: send `command`, then wait for `<want> <n> <bytes> <ms>`."""
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write(command + "\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -2056,7 +2116,7 @@ class StrataEngine:
                 self.proc.wait(timeout=20)
             except (OSError, AttributeError, subprocess.TimeoutExpired):
                 pass
-            return EngineDied(f"the engine answered a session {action} with {line.strip()[:200]!r}; "
+            return EngineDied(f"the engine answered a {what} with {line.strip()[:200]!r}; "
                               "the server ended the engine")
 
         def count(s: str) -> int:
@@ -2074,7 +2134,7 @@ class StrataEngine:
                     raise queue.Empty
                 line = self.lines.get(timeout=left)
             except queue.Empty:
-                raise self._silent(f"the engine said nothing for {limit:.0f} s during a session {action}"
+                raise self._silent(f"the engine said nothing for {limit:.0f} s during a {what}"
                                    + (f" (in a blocking step allowed {allow:.0f} s)" if allow > silence else "")) from None
             if line is None:
                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
@@ -2110,16 +2170,33 @@ class StrataEngine:
                 if len(parts) != 4 or parts[1] not in SessionRefused.STATUS or parts[2] not in ("0", "1"):
                     raise out_of_step(line)
                 raise SessionRefused(parts[1], parts[3].strip(), parts[2] == "1")
+            if head == want == "ACQUIRED":                # key=value fields
+                try:
+                    kv = dict(x.split("=", 1) for x in f[1:])
+                    out = {k: count(kv[k]) for k in ("restored", "of", "bytes")}
+                    out["status"] = kv["status"]
+                    out["ms"] = float(kv["ms"])
+                    if not out["status"].isalpha() or not math.isfinite(out["ms"]) or out["ms"] < 0:
+                        raise ValueError
+                except (ValueError, KeyError):
+                    raise out_of_step(line) from None
+                return out
             if head == want:
                 try:
-                    if len(f) != 4:
+                    # HIBERNATED alone may add live=0|1 (was the current conversation saved), RELEASED freed=<bytes>
+                    extra = f[4:] if want == "HIBERNATED" and len(f) == 5 and f[4] in ("live=0", "live=1") else None
+                    freed = None
+                    if want == "RELEASED" and len(f) == 5 and f[4].startswith("freed="):
+                        freed, extra = count(f[4][6:]), []
+                    if len(f) != 4 and extra is None:
                         raise ValueError
                     tokens, size, ms = count(f[1]), count(f[2]), float(f[3])
                     if not math.isfinite(ms) or ms < 0:
                         raise ValueError
                 except ValueError:
                     raise out_of_step(line) from None
-                return {"tokens": tokens, "bytes": size, "ms": ms}
+                return {"tokens": tokens, "bytes": size, "ms": ms,
+                        **({"live": int(extra[0][5:])} if extra else {}), **({"freed": freed} if freed is not None else {})}
             if head == "INFO" or head == "WARN":          # engine log lines may interleave; they are not answers
                 heard = time.monotonic()
                 continue
@@ -2136,7 +2213,7 @@ class StrataEngine:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=getattr(self, "quit_s", 20))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=20)
@@ -2606,6 +2683,14 @@ def engine_args(cfg: dict) -> list[str]:
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
 
 
+def disk_persist_mode(args: list[str]) -> str:
+    """--conversation-disk-persist's value (#1937: off|on|exit-only); "off" when absent or without a value."""
+    if "--conversation-disk-persist" not in args:
+        return "off"
+    i = args.index("--conversation-disk-persist") + 1
+    return args[i] if i < len(args) and args[i] in ("off", "on", "exit-only") else "off"
+
+
 def parallel_args(cfg: dict, args: list[str]) -> list[str]:
     """#465 (opt-in): "parallel": N in the config - up to N requests decode together in the engine's batch slots
     (--batch N); more wait their turn.  1 or absent: one request at a time, as before.  A value the engine cannot use
@@ -3040,9 +3125,16 @@ class Service:
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
+        self.agent_sessions = {}                        # local: opencode session id -> its request (status_lock)
+        self.req_local = threading.local()              # local: this thread's request (its key in agent_sessions)
+        self.req_seq = 0
+        self._session_info = {}                         # local: opencode session id -> (when, its title, parent, task)
+        self.restart_requested = threading.Event()      # local: POST /restart - main() ends with RESTART_EXIT_CODE
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        # local: keys that may use the model only ("api_key_file" {"model": [...]}) - see Handler._model_key_allows
+        self.model_keys: list[str] = []
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
@@ -3085,12 +3177,40 @@ class Service:
         # only start it again when this much VRAM is free, and run this command first (e.g. to unload another
         # server's model); the next request after an unload starts the engine again
         self.idle_unload_s = 0
+        self.idle_release_s = 0                         # local: give the RAM back (keep the GPU) after this idle
         self.min_free_vram_mib = 0
         self.before_load = None
         self.before_load_timeout_s = 120.0               # #1997: how long the before_load command may run
         self.before_load_ignore_failure = False          # #1997: load even when it fails, without a VRAM check
         self.vram_free_wait_s = 15.0                     # how long a full card is waited on (memory given back)
         self.before_load_strict = False                  # #1997: refuse (503) whenever it fails
+        self.hibernate_dir = None                        # hibernate/resume: the folder (its hibernate.txt is the latch)
+        self.last_hibernate = None                       # the engine's last HIBERNATED answer (saved, bytes, ms, live)
+        # local: the lease table (serve/leases.py), the old holds file's replacement: a job's wrapper registers a lease,
+        # renews it every ~10 s, and ends it; one nobody renews for lease_expire_s expires. "held" means a live pid
+        # holder or a live lease.  The table opens on first use (lease_table()); the watcher passes it every 5 s.
+        self.leases_dir = None                           # the table's folder (default <hibernate_dir>/leases)
+        self.lease_clock = time.time                     # the clock the table is opened with (tests fake it)
+        self.lease_expire_s = 45.0                       # "lease_expire_s" in the run config
+        self._lease_table = None                         # the LeaseTable, opened on first use
+        self._lease_last_pass = None                     # lease_clock() at the previous lease_pass()
+        self._lease_resume_in_flight = False             # a lease_pass()'s ensure_loaded(resume=True) is under way
+        self._lease_open_lock = threading.Lock()         # opens the table once, even on first use from two threads
+        self._lease_create_lock = threading.Lock()       # POST /lease: create + suspend one at a time (two at once wait)
+        # local: the engine runs --conversation-disk-persist (main() sets it).  A full hibernate is then QUIT (the
+        # engine writes to its disk tier only what is not there yet) plus a "mode disk" latch; a resume is a plain
+        # start, and each conversation comes back from the disk when a request continues it.
+        self.disk_persist = False
+        # "resume_on_request": a request to a hibernated model resumes it - only once the RAM and VRAM its hibernate
+        # gave back are free again (resume_needs; plus "resume_margin_mib" of RAM), waiting up to "resume_wait_s"
+        # for them; else 503 with Retry-After.  Off: 503 until POST /load, as before.
+        self.resume_on_request = False
+        self.resume_margin_mib = 4096
+        self.resume_wait_s = 0.0
+        # "memory_check_on_load": the same check before a plain reload (after /unload, an idle unload): every unload
+        # records what it gave back (also kept in memory when there is no hibernate folder).  Off: it loads as before.
+        self.memory_check_on_load = False
+        self._needs = None                               # the last unload's record (RAM / VRAM MiB)
         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
         self.vram_reserve_asked = False                  # a POST /v1/vram was made (vram_reserve None is then asked)
         self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
@@ -3106,7 +3226,540 @@ class Service:
                             tokenizer.encode("<|endoftext|>", parse_special=True))
 
     def loaded(self) -> bool:
-        return not hasattr(self.engine, "alive") or self.engine.alive()
+        """Running and serving: not while a partial hibernate has the engine's RAM given back (it is alive then)."""
+        return (not hasattr(self.engine, "alive") or self.engine.alive()) and not self.released()
+
+    def released(self) -> bool:
+        """A partial hibernate (/unload {"save": true, "keep_gpu": true}): the engine runs with its VRAM, its RAM
+        given back, until a resume (ACQUIRE)."""
+        return bool(getattr(self.engine, "released", False)) and \
+            (not hasattr(self.engine, "alive") or self.engine.alive())
+
+    def lease_model_loaded(self) -> bool:
+        """POST /lease's "was the model loaded": fully loaded, or a lease's resume is in flight (the previous lease
+        ended and its ensure_loaded(resume=True) is under way - the model is not up yet, but a new lease that recorded
+        it as off would leave the model off for good).  A RAM-released model (idle release) is not: after the job it
+        stays as it was (test_a_ram_only_model_is_not_brought_back_fully_after_a_job)."""
+        return self._lease_resume_in_flight or self.loaded()
+
+    # ---- hibernate/resume: the folder's hibernate.txt (written by the engine's HIBERNATE) is the latch
+
+    def _hibernate_manifest(self) -> Path | None:
+        return Path(self.hibernate_dir) / "hibernate.txt" if self.hibernate_dir else None
+
+    def hibernated(self) -> bool:
+        """While the folder's manifest exists the model stays unloaded - a request answers 503 instead of loading the
+        engine back over whatever is using the GPU - until POST /load (which restores the conversations) or
+        POST /load {"fresh": true} (which discards them).  A file, so it survives a server restart."""
+        m = self._hibernate_manifest()
+        return m is not None and m.exists()
+
+    # ---- local: who holds the model.  A live lease (serve/leases.py) is the only lock: while one lives nothing
+    # resumes the model - not resume_on_request, not POST /load (only {"force": true}) - so no agent window brings it
+    # back over the job.  When the last one ends (released, expired, stopped or overridden), the watcher's lease pass
+    # resumes the model by itself.
+
+    HOLD_RETRY_S = 60
+
+    def held_by(self) -> list:
+        """The live leases while one holds the model ([] when nothing does): each {"id", "cmd", "cwd", "session",
+        "mode", "age_s"}, oldest first.  A read of the open table; a table that cannot be read holds the model
+        (lease_holds) but has no lease to name."""
+        if self._lease_table is None:
+            return []
+        try:
+            now = self.lease_clock()
+            return [{"id": l["id"], "cmd": l.get("cmd"), "cwd": l.get("cwd"), "session": l.get("session"),
+                     "mode": l.get("mode"), "age_s": round(now - float(l.get("created") or now), 1)}
+                    for l in self._lease_table.live()]
+        except Exception:  # noqa: BLE001 - who holds it is a help; lease_holds is the lock
+            return []
+
+    AGENT_RECENT_S = 180                         # a session whose request ended this recently is between two steps
+
+    @contextlib.contextmanager
+    def agent_request(self, headers, path=None):
+        """Local: every request while it runs - queued for the turn, waiting out a hold, loading the model,
+        generating - with who sent it.  An opencode session (opencode sends x-opencode-session-id) and a Claude Code
+        session (x-claude-code-session-id) stay listed for
+        AGENT_RECENT_S after (its tools run between two steps); the heartbeat writes those every minute, so after a
+        crash it says who was working.  A request without a session (the web page, another tool) is listed while
+        it runs, by the program that sent it."""
+        sid = (headers.get("x-opencode-session-id") or headers.get("x-session-id")
+               or headers.get("x-claude-code-session-id")) if headers else None
+        ua = (headers.get("User-Agent") or "") if headers else ""
+        client = "opencode" if ua.startswith("opencode") else "web page" if "Mozilla" in ua else \
+            (ua.split("/")[0] or "a client")
+        with self.status_lock:
+            self.req_seq += 1
+            key = sid or f"request {self.req_seq}"
+            self.agent_sessions[key] = {"state": "queued", "since": time.time(), "active": True, "session": sid,
+                                        "client": client, "path": path}
+        self.req_local.key = key
+        try:
+            yield key
+        finally:
+            self.req_local.key = None
+            with self.status_lock:
+                if key in self.agent_sessions:
+                    if sid:
+                        self.agent_sessions[key].update(state="between steps", active=False, ended=time.time())
+                    else:
+                        del self.agent_sessions[key]
+
+    def this_request_is(self, state: str) -> None:
+        self.agent_state(getattr(self.req_local, "key", None), state)
+
+    SESSION_INFO_S = 30.0
+
+    def requests_now(self) -> list:
+        """The requests running now, in order (generating first, then the waiting ones by arrival), each with who
+        sent it: the opencode session's title and agent, and for a subagent its parent session and the task it was
+        given (tools/strata_jobs.py session_info, cached SESSION_INFO_S)."""
+        now = time.time()
+        with self.status_lock:
+            active = [(k, dict(r)) for k, r in self.agent_sessions.items() if r.get("active")]
+        out = []
+        for key, r in active:
+            entry = {"state": r["state"], "waiting_s": round(now - r["since"]), "client": r.get("client"),
+                     "session": r.get("session")}
+            sid = r.get("session")
+            if sid:
+                cached = self._session_info.get(sid)
+                if not cached or now - cached[0] > self.SESSION_INFO_S:
+                    try:
+                        sys.path.insert(0, str(ROOT / "tools"))
+                        import strata_jobs
+                        cached = (now, strata_jobs.session_info(sid))
+                    except Exception:  # noqa: BLE001 - who sent it is a help, never a failure
+                        cached = (now, {})
+                    self._session_info[sid] = cached
+                entry.update(cached[1])
+            out.append(entry)
+        out.sort(key=lambda e: (e["state"] != "generating", -e["waiting_s"]))
+        return out
+
+    def agent_state(self, sid, state: str) -> None:
+        if sid:
+            with self.status_lock:
+                if sid in self.agent_sessions:
+                    self.agent_sessions[sid]["state"] = state
+
+    def live_requests(self) -> dict:
+        """The sessions with a request now, or one that ended in the last AGENT_RECENT_S."""
+        now = time.time()
+        with self.status_lock:
+            for sid in [s for s, r in self.agent_sessions.items()
+                        if not r.get("active") and now - r.get("ended", now) > self.AGENT_RECENT_S]:
+                del self.agent_sessions[sid]
+            return {sid: dict(r) for sid, r in self.agent_sessions.items()}
+
+    def start_hold_watch(self, every_s: float = 5.0):
+        def loop():
+            last = ""
+            while True:
+                time.sleep(every_s)
+                try:
+                    r = self.lease_pass()                    # local: the lease table is the lock (serve/leases.py)
+                except Exception as e:  # noqa: BLE001 - the watcher must keep running
+                    r = f"waiting: {e}"
+                if r.startswith("waiting") and r != last:
+                    print(f"[strata] lease: the jobs ended, the resume {r}", flush=True)
+                last = r
+        threading.Thread(target=loop, daemon=True, name="hold-watch").start()
+
+    # ---- local: leases (serve/leases.py): the same hold as the pid holds, kept alive by renewals instead of a live
+    # process.  "held" means a live pid holder or a live lease (not lease_table().safe_to_load()).
+
+    LEASE_PAUSE_S = 20.0
+
+    def _leases_folder(self) -> str | None:
+        if self.leases_dir:
+            return str(self.leases_dir)
+        return str(Path(self.hibernate_dir) / "leases") if self.hibernate_dir else None
+
+    def lease_table(self):
+        """The LeaseTable, opened on first use (expire_s "lease_expire_s", the clock self.lease_clock)."""
+        if self._lease_table is None:
+            with self._lease_open_lock:                   # two requests at the first use: one table, one writer lock
+                if self._lease_table is None:
+                    d = self._leases_folder()
+                    if d is None:
+                        raise ValueError("no lease folder: set \"leases_dir\" or \"hibernate_dir\" in the run config")
+                    from serve.leases import LeaseTable
+                    self._lease_table = LeaseTable(Path(d), expire_s=self.lease_expire_s, clock=self.lease_clock)
+        return self._lease_table
+
+    def close_leases(self) -> None:
+        """Close the lease table (its writer lock goes with it); the next lease_table() opens it again."""
+        t, self._lease_table = self._lease_table, None
+        if t is not None:
+            t.close()
+
+    def lease_holds(self) -> bool:
+        """A live lease (or an unknown owner inside its grace) holds the model.  Only an open table counts: main()
+        opens it at the start; a server that never opened one has no lease folder to hold on.  Fail closed: a table
+        that cannot be read holds the model, as an unreadable holds file does."""
+        if self._lease_table is None:
+            return False
+        try:
+            return not self._lease_table.safe_to_load()
+        except Exception:  # noqa: BLE001 - nothing loads over a job it cannot see
+            return True
+
+    def lease_live(self) -> list:
+        if self._lease_table is None:
+            return []
+        try:
+            return self._lease_table.live()
+        except Exception:  # noqa: BLE001
+            return []
+
+    def lease_override_all(self) -> list:
+        if self._lease_table is None:
+            return []
+        try:
+            return self._lease_table.override_all()
+        except Exception:  # noqa: BLE001
+            return []
+
+    def lease_pass(self) -> str:
+        """One watcher pass: a pause (the previous pass more than LEASE_PAUSE_S ago by lease_clock) renews every
+        live lease instead of expiring anything; else expire_pass().  Then, once nothing holds and a resume is
+        pending, bring the model back the way the pid holds do (ensure_loaded(resume=True), under the fifo)."""
+        t = self.lease_table()
+        now = self.lease_clock()
+        last = self._lease_last_pass
+        self._lease_last_pass = now
+        if last is not None and now - last > self.LEASE_PAUSE_S:
+            t.refresh_all()
+        else:
+            t.expire_pass()
+        if t.safe_to_load() and t.take_resume():
+            self._lease_resume_in_flight = True          # a /lease asked now counts the model as loaded
+            try:
+                with self.fifo:
+                    self.ensure_loaded(resume=True)
+            except (GpuBusy, RuntimeError, OSError) as e:
+                t.restore_resume()                       # the memory was not free: the next pass tries again
+                return f"waiting: {e}"
+            finally:
+                self._lease_resume_in_flight = False
+            self.last_request_at = time.time()           # just back: the idle stages count from now
+            print("[strata] the job that held the model on a lease has ended: resumed", flush=True)
+            return "resumed"
+        return ""
+
+    def lease_pass_quietly(self) -> str:
+        """lease_pass() for a request that waited out a hold: a table error is left to the watcher."""
+        try:
+            return self.lease_pass()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def lease_drop_pending_resume(self) -> None:
+        """A deliberate hibernate (the web page's, not a job's): a resume still pending from ended leases (the memory
+        was not free) must not bring the model back later.  Only when the table is open and no lease holds."""
+        if self._lease_table is None:
+            return
+        try:
+            self._lease_table.clear_resume()
+        except Exception:  # noqa: BLE001 - the hibernate itself matters more; the watcher retries
+            pass
+
+    def lease_checkpoint(self, shutting_down: bool = False) -> None:
+        """The conversations a hold's save put on disk: keep a copy of the live leases, who is working and the
+        session files in the table's checkpoint.json.  Only when the table is open (main() opens it at the start).
+        shutting_down rides inside the table's own atomic write, so no beat can overwrite the mark."""
+        if self._lease_table is None:
+            return
+        self._move_prev_checkpoint()
+        t = self._lease_table
+        # who is working: only this server's own requests (no file reads). An opencode request names its client
+        # "opencode" (its User-Agent); a Claude Code request's client starts with "claude" (claude-cli/...)
+        register = {"opencode": {}, "claude": {}}
+        for sid, r in self.live_requests().items():
+            client = str(r.get("client") or "")
+            agent = "opencode" if client == "opencode" else "claude" if client.startswith("claude") else None
+            if r.get("session") and agent:
+                register[agent][sid] = r.get("state")
+        files = []
+        m = self._hibernate_manifest()
+        if m is not None:
+            try:
+                files = [ln[5:].strip() for ln in m.read_text(encoding="utf-8").splitlines()
+                         if ln.startswith("file ")]
+            except OSError:
+                files = []
+        if not files:
+            files = self._lease_last_files            # the last save's, kept (the manifest is gone after a resume)
+        else:
+            self._lease_last_files = files
+        try:
+            t.checkpoint(register, files, **({"shutting_down": True} if shutting_down else {}))
+        except OSError as e:
+            print(f"[strata] lease: the checkpoint could not be written ({e})", flush=True)
+
+    _lease_prev_moved = False
+    _lease_last_files: list = []
+
+    def _move_prev_checkpoint(self) -> None:
+        """Once per server start, before the first new write: the previous run's checkpoint.json goes aside to
+        checkpoint.prev.json - the one record of who was working when this server (or the PC) went down, which the
+        waker reads.  A new run's beats then start a fresh checkpoint.json."""
+        if self._lease_prev_moved or self._lease_table is None:
+            return
+        self._lease_prev_moved = True
+        d = Path(self._leases_folder())
+        try:
+            if (d / "checkpoint.json").exists():
+                os.replace(d / "checkpoint.json", d / "checkpoint.prev.json")
+        except OSError:
+            pass
+
+    LEASE_BEAT_S = 60.0
+
+    def start_lease_beat(self, every_s: float = LEASE_BEAT_S) -> None:
+        """The lease checkpoint is the one record of who was working: keep the previous run's aside, then write one
+        every `every_s` (register = this server's own requests, files = the last save's).  Replaces the old
+        strata-alive heartbeat."""
+        self._lease_table = self.lease_table()          # open the table (its folder is where the checkpoint lives)
+        self._move_prev_checkpoint()
+        self._lease_beat_stop = threading.Event()
+
+        def loop():
+            while not self._lease_beat_stop.wait(every_s):
+                self.lease_beat()
+
+        self._lease_beat_thread = threading.Thread(target=loop, daemon=True, name="lease-beat")
+        self._lease_beat_thread.start()
+
+    def stop_lease_beat(self) -> None:
+        """End the beat thread and wait for it: a beat already under way finishes before we go, so a marked beat
+        written after this call is the checkpoint's last word."""
+        ev = getattr(self, "_lease_beat_stop", None)
+        if ev is not None:
+            ev.set()
+        th = getattr(self, "_lease_beat_thread", None)
+        if th is not None and th is not threading.current_thread():
+            th.join(timeout=10.0)
+        self._lease_beat_thread = None
+
+    def lease_beat(self, shutting_down: bool = False) -> None:
+        """Write the checkpoint now; with shutting_down, stop the beat thread first and mark the write so the waker
+        knows the run ended cleanly (its register is not a list of sessions cut off mid-request).  The mark rides
+        inside the table's own atomic checkpoint write, never a second read-modify-write."""
+        if shutting_down:
+            self.stop_lease_beat()
+        self.lease_checkpoint(shutting_down=shutting_down)
+
+    DISK_LATCH = "mode disk"                         # local: the latch of a hibernate through the disk tier
+
+    def _hibernate_on_disk(self) -> bool:
+        """Local: the latch was written by a hibernate through the disk tier (its conversations are the engine's
+        --conversation-disk-dir files, taken in by a plain start), not by the engine's HIBERNATE."""
+        try:
+            return self._hibernate_manifest().read_text(encoding="utf-8").splitlines()[:1] == [self.DISK_LATCH]
+        except (OSError, AttributeError, ValueError):
+            return False
+
+    def _write_disk_latch(self) -> None:
+        m = self._hibernate_manifest()
+        m.parent.mkdir(parents=True, exist_ok=True)
+        tmp = m.with_name(m.name + ".tmp")
+        tmp.write_text(self.DISK_LATCH + "\n", encoding="utf-8")
+        tmp.replace(m)
+
+    # ---- resuming only into free memory: what the engine gave back at its hibernate must be free again first
+
+    RESUME_NEEDS = "resume-needs.json"   # beside the manifest (the engine removes only its hib-*.strs names)
+    RESUME_SETTLE_S = 1.0                # an ended process's memory takes a moment to show as free
+    RESUME_VRAM_SLACK_MIB = 512          # the desktop's own use drifts by this much
+    RESUME_RETRY_S = 30
+
+    def _available_ram_mib(self) -> int | None:
+        try:
+            import psutil
+            return int(psutil.virtual_memory().available >> 20)
+        except Exception:
+            return None
+
+    def _free_resources(self) -> dict:
+        return {"ram_mib": self._available_ram_mib(), "vram_mib": self.free_vram_mib()}
+
+    def _record_resume_needs(self, before: dict, hibernated: bool = True) -> None:
+        """After an unload: the RAM and VRAM the engine gave back (free after its exit less free before), kept in
+        memory and beside the hibernate manifest (when there is a folder) so a resume or a reload - also by a server
+        started later - first checks that much is free again."""
+        time.sleep(self.RESUME_SETTLE_S)
+        after = self._free_resources()
+        needs = {k: max(0, after[k] - before[k]) for k in ("ram_mib", "vram_mib")
+                 if before.get(k) is not None and after.get(k) is not None}
+        self._needs = needs or None
+        if self.hibernate_dir:
+            path = Path(self.hibernate_dir) / self.RESUME_NEEDS
+            try:
+                if needs:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(json.dumps(needs), encoding="utf-8")
+                elif path.exists():                     # nothing measured now: an older record must not stand in
+                    path.unlink()
+            except OSError as e:
+                print(f"[strata] could not record what a reload needs ({e})", flush=True)
+        if needs and (hibernated or self.memory_check_on_load):
+            print("[strata] the engine gave back " + ", ".join(f"{v} MiB of {k[:-4].upper()}" for k, v in needs.items()) +
+                  f" - a {'resume' if hibernated else 'reload'} waits until that is free again", flush=True)
+
+    def resume_needs(self) -> dict | None:
+        """The RAM and VRAM (MiB) the last unload gave back, or None when it was not measured: this server's record,
+        else the hibernate folder's (a server started later)."""
+        if self._needs:
+            return dict(self._needs)
+        if not self.hibernate_dir:
+            return None
+        try:
+            raw = json.loads((Path(self.hibernate_dir) / self.RESUME_NEEDS).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        needs = {k: v for k, v in raw.items() if k in ("ram_mib", "vram_mib") and isinstance(v, int)
+                 and not isinstance(v, bool) and v >= 0}
+        return needs or None
+
+    def resume_status(self) -> dict:
+        """For /health while hibernated (or unloaded, with "memory_check_on_load"): what a resume needs and what keeps
+        it from fitting now (None: it fits)."""
+        if not self.hibernated() and not (self.memory_check_on_load and getattr(self.engine, "unloaded", False)):
+            return {}
+        return {"resume_needs": self.resume_needs(), "resume_blocked": self.resume_blocked(),
+                "resume_on_request": self.resume_on_request}
+
+    def resume_blocked(self) -> str | None:
+        """Why a resume would not fit now, or None (it fits, or nothing was measured)."""
+        needs = self.resume_needs()
+        if not needs:
+            return None
+        short = []
+        if "ram_mib" in needs:
+            have, want = self._available_ram_mib(), needs["ram_mib"] + self.resume_margin_mib
+            if have is not None and have < want:
+                short.append(f"{have} MiB of RAM available, it needs {want} ({needs['ram_mib']} that its hibernate "
+                             f"gave back + {self.resume_margin_mib} resume_margin_mib)")
+        if "vram_mib" in needs:
+            have, want = self.free_vram_mib(), needs["vram_mib"] - self.RESUME_VRAM_SLACK_MIB
+            if have is not None and have < want:
+                short.append(f"{have} MiB of VRAM free, it needs {want}")
+        return "; ".join(short) or None
+
+    def _wait_resumable(self, wait_s: float) -> str | None:
+        """resume_blocked(), polled for up to wait_s seconds while something else may be giving memory back."""
+        deadline = time.time() + max(0.0, wait_s)
+        blocked = self.resume_blocked()
+        while blocked and time.time() < deadline:
+            time.sleep(1.0)
+            blocked = self.resume_blocked()
+        return blocked
+
+    def discard_hibernate(self) -> str | None:
+        """POST /load {"fresh": true}: move the manifest to hibernate.txt.discarded (an older one is replaced; the
+        files it names go with the next hibernate).  The reason when it cannot be moved: then nothing may be loaded,
+        or the conversations the caller wanted gone would be restored."""
+        if not self.hibernated():
+            return None
+        m = self._hibernate_manifest()
+        try:
+            m.replace(m.with_name(m.name + ".discarded"))
+        except OSError as e:
+            return f"the hibernate manifest could not be discarded ({e}); nothing was loaded"
+        print("[strata] hibernate: discarded; starting clean", flush=True)
+        return None
+
+    def _hibernate_aside(self, suffix: str) -> Path | None:
+        """Move the manifest to hibernate.txt<suffix> (replacing an older one): the latch ends, the files stay on disk
+        for a look later (the next hibernate removes them).  None (and a log line) when it cannot be moved."""
+        m = self._hibernate_manifest()
+        aside = m.with_name(m.name + suffix)
+        try:
+            m.replace(aside)
+            return aside
+        except OSError as e:
+            print(f"[strata] hibernate: could not move {m} to {aside.name} ({e})", flush=True)
+            return None
+
+    def _hibernate_spent(self) -> None:
+        """Every conversation came back: delete the manifest and the files it names (entry names only)."""
+        m = self._hibernate_manifest()
+        try:
+            names = [ln[5:].strip() for ln in m.read_text(encoding="utf-8").splitlines() if ln.startswith("file ")]
+        except OSError:
+            names = []
+        try:
+            m.unlink()
+        except OSError:
+            self._hibernate_aside(".restored")
+            return
+        for n in names:
+            if re.fullmatch(r"hib-\d{1,20}-\d{1,20}\.strs", n):
+                try:
+                    (m.parent / n).unlink()
+                except OSError:
+                    pass
+
+    def _settle_hibernate(self) -> None:
+        """After a start with --hibernate-dir: act on the engine's `HIBERNATE restored=N of=M bytes=B status=S`.
+        ok: the folder is spent.  partial / foreign / corrupt: settled - the manifest is set aside (.partial /
+        .refused) and the model runs with what came back.  memory / off / io: the same folder may restore later (more
+        free RAM, the cache on again), so the manifest - and the latch - stay, and the engine is unloaded again (503)."""
+        info = getattr(self.engine, "info", {}) or {}
+        n, of, status = info.get("hibernate_restored"), info.get("hibernate_of"), info.get("hibernate_status")
+        d = self.hibernate_dir
+        if n is None:
+            print(f"[strata] hibernate: the engine did not report a restore; {d} is kept", flush=True)
+            return
+        status = status or ("ok" if n else "memory")
+        counted = f"{n}" + (f" of {of}" if of is not None else "")
+        if status == "ok":
+            print(f"[strata] hibernate: {counted} conversation(s) re-parked from {d}", flush=True)
+            self._hibernate_spent()
+        elif status == "partial":
+            aside = self._hibernate_aside(".partial")
+            print(f"[strata] hibernate: {counted} conversation(s) re-parked (the rest did not fit or were refused; see "
+                  f"the engine log){f'; the manifest is kept as {aside.name}' if aside else ''}", flush=True)
+        elif status in ("foreign", "corrupt"):
+            aside = self._hibernate_aside(".refused")
+            print(f"[strata] hibernate: {d} was refused ({status}: another model, engine build or configuration, or "
+                  f"damaged - see the engine log); starting with an empty conversation cache"
+                  f"{f'; the manifest is kept as {aside.name}' if aside else ''}", flush=True)
+        else:                                           # memory, off, io: worth trying again later
+            print(f"[strata] hibernate: {d} was not restored ({status}); the hibernation is kept", flush=True)
+            self.engine.unload()
+            if self.vision is not None and hasattr(self.vision, "unload"):
+                self.vision.unload()
+            why = {"memory": "not enough free RAM (or conversation-cache budget) for the saved conversations",
+                   "off": "the conversation cache is off (or --batch / a layer split is on) in this configuration",
+                   "io": "the files could not be read"}.get(status, status)
+            raise GpuBusy(f"the saved conversations were not restored: {why}. The model stays hibernated - free RAM "
+                          f"(or fix the configuration) and POST /load again, or /load {{\"fresh\": true}} to start "
+                          f"without them")
+
+    def _restart_without_hibernate(self, error: Exception) -> None:
+        """The engine did not start with --hibernate-dir: set the manifest aside (.unrestorable) and start once more
+        without it.  When that start fails too, the folder was not the cause: the manifest goes back (latch stays)."""
+        aside = self._hibernate_aside(".unrestorable")
+        if aside is None:
+            raise error
+        print(f"[strata] hibernate: the engine did not start with {self.hibernate_dir}; its manifest is kept as "
+              f"{aside.name} and the engine starts without it", flush=True)
+        self.engine.set_hibernate_arg(None)
+        try:
+            self.engine.restart()
+        except RuntimeError:
+            try:
+                aside.replace(self._hibernate_manifest())
+            except OSError:
+                pass
+            raise
 
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
@@ -3313,12 +3966,38 @@ class Service:
         except Exception:
             return None
 
-    def ensure_loaded(self):
+    def ensure_loaded(self, resume: bool = False, force: bool = False):
         """Start the engine if it is not running (unloaded, or it died - issue #27), after the before_load hook and
-        the free-VRAM check.  The caller holds self.fifo."""
+        the free-VRAM check.  The caller holds self.fifo.  resume=True (an explicit POST /load) also re-parks a
+        hibernated folder; without it a hibernated model refuses to load (503) - unless "resume_on_request".  A
+        hibernated model resumes only once the RAM and VRAM its hibernate gave back are free again (resume_blocked;
+        force=True, POST /load {"force": true}, skips that check)."""
         if self.loaded() and not self._vision_down():
             return
+        if not force and self.lease_holds():         # local: a live lease holds it: nothing loads over the job
+            raise GpuBusy("Strata is suspended for a running job (a lease): nothing loads the model over it; it "
+                          "resumes by itself when the lease ends. POST /load {\"force\": true} resumes it anyway",
+                          retry_after=self.HOLD_RETRY_S)
         hook_failed = None
+        by_request = False
+        if self.hibernated() and not resume:
+            if not self.resume_on_request:
+                raise GpuBusy(f"the model is hibernating (its conversations are saved in {self.hibernate_dir}): POST "
+                              "/load to resume them, or /load {\"fresh\": true} to start clean")
+            resume = by_request = True
+        if self.hibernated() and not force:
+            blocked = self._wait_resumable(self.resume_wait_s if by_request else 0.0)
+            if blocked:
+                raise GpuBusy(f"the model is hibernating and stays so until its memory is free: {blocked}. It resumes "
+                              f"once that is free{' (the next request)' if by_request else ''}; POST /load "
+                              "{\"force\": true} resumes it anyway", retry_after=self.RESUME_RETRY_S)
+        elif not force and self.memory_check_on_load and getattr(self.engine, "unloaded", False):
+            blocked = self._wait_resumable(0.0 if resume else self.resume_wait_s)
+            if blocked:
+                raise GpuBusy(f"the model is unloaded and stays so until its memory is free: {blocked}. It loads once "
+                              "that is free; POST /load {\"force\": true} loads it anyway", retry_after=self.RESUME_RETRY_S)
+            if by_request:
+                print("[strata] hibernate: a request resumes the model (the RAM and VRAM it needs are free)", flush=True)
         if self.before_load:
             cmd = self.before_load
             print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
@@ -3350,7 +4029,8 @@ class Service:
                           flush=True)
                 else:
                     print(f"[strata] the before_load command failed ({why}); checking the free VRAM", flush=True)
-        if self.min_free_vram_mib and not (hook_failed and self.before_load_ignore_failure):
+        if (self.min_free_vram_mib and not (hook_failed and self.before_load_ignore_failure)
+                and not self.released()):   # a released engine still holds its VRAM
             free = self.free_vram_mib()
             deadline = time.time() + self.vram_free_wait_s   # memory another process just gave back can take a moment
             while free is not None and free < self.min_free_vram_mib and time.time() < deadline:
@@ -3377,14 +4057,48 @@ class Service:
             vision_started = True
         if self.loaded():
             return
+        if self.released():                             # partial hibernate: the engine takes its RAM again
+            info = getattr(self.engine, "info", None)
+            print("[strata] partial hibernate: resuming (the experts are read again) ...", flush=True)
+            try:
+                r = self.engine.acquire(str(self.hibernate_dir))
+            except (EngineDied, EngineStuck) as e:      # it could not: the engine ended, a full start follows
+                print(f"[strata] partial hibernate: the engine could not take its RAM again ({e}); starting it again",
+                      flush=True)
+            else:
+                if isinstance(info, dict):
+                    for k in ("restored", "of", "bytes", "status"):
+                        info["hibernate_" + k] = r.get(k)
+                print(f"[strata] partial hibernate: resumed in {r['ms'] / 1000:.1f} s", flush=True)
+                self._settle_hibernate()
+                return
         if getattr(self.engine, "unloaded", False):
             print("[strata] loading the model again (it was unloaded) ...", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
             print(f"[strata] the engine had stopped (exit code {code}); starting it again "
                   "(a minute or two) ...", flush=True)
+        can_hibernate = hasattr(self.engine, "set_hibernate_arg") and hasattr(self.engine, "spawn")
+        restoring = can_hibernate and self.hibernated()
+        from_disk = restoring and self._hibernate_on_disk()   # local: a plain start takes the disk tier's files in
+        if from_disk:
+            restoring = False
+        if can_hibernate:
+            self.engine.set_hibernate_arg(self.hibernate_dir if restoring else None)
+        info = getattr(self.engine, "info", None)
+        if isinstance(info, dict):                      # an earlier start's restore report must not settle this one
+            for k in [k for k in info if k.startswith("hibernate_")]:
+                del info[k]
         try:
-            self.engine.restart()
+            try:
+                self.engine.restart()
+            except EngineStuck:
+                raise
+            except RuntimeError as e:
+                if not restoring:
+                    raise
+                self._restart_without_hibernate(e)
+                restoring = False
         except Exception:
             if vision_started:
                 self.vision.unload()
@@ -3392,6 +4106,12 @@ class Service:
         print("[strata] the engine is running again", flush=True)
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
             images_api.restore_session(self)
+        if restoring:
+            self._settle_hibernate()
+        elif from_disk:
+            print("[strata] hibernate: resumed; each conversation comes back from the disk when a request continues it",
+                  flush=True)
+            self._hibernate_spent()
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
             try:
                 self.engine.vram(self.vram_reserve)
@@ -3438,8 +4158,10 @@ class Service:
         print(f"[strata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
-    def load(self):
-        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy)."""
+    def load(self, resume: bool = False, force: bool = False):
+        """POST /load and every generation request: start the engine now if it is unloaded (raises GpuBusy).
+        resume=True only from an explicit /load: it re-parks a hibernated folder (GpuBusy while hibernated, unless
+        "resume_on_request"); force=True skips the free-memory check of a resume."""
         # a request is on its way: the idle thread must not unload between this and the request's own start
         self.last_request_at = time.time()
         if self.loaded() and not self._vision_down():
@@ -3459,9 +4181,15 @@ class Service:
                     with self.status_lock:
                         trace["queue_s"] += round(loading - waiting, 3)
                         trace["state"] = "loading"
+                if not self.loaded() or self.released():   # local: the Monitor says the engine is coming up
+                    self.this_request_is("loading the model")
+                    with self.status_lock:
+                        self.status["loading"] = "resuming" if (self.hibernated() or self.released()) else "loading"
                 try:
-                    self.ensure_loaded()
+                    self.ensure_loaded(resume=resume, force=force)
                 finally:
+                    with self.status_lock:
+                        self.status.pop("loading", None)
                     if trace is not None:
                         with self.status_lock:
                             trace["load_s"] += round(time.perf_counter() - loading, 3)
@@ -3473,24 +4201,44 @@ class Service:
 
     UNLOAD_WAIT_S = 300.0       # #1997: POST /unload?wait=1 waits this long for the running turn (wait=<s> to choose)
 
-    def unload_waiting(self, wait_s: float) -> str:
+    def unload_waiting(self, wait_s: float, save: bool = False, keep_gpu: bool = False, own_lease=None) -> str:
         """#1997: unload(), but a running or queued request is waited for (up to wait_s) instead of answering "busy":
         a peer server that needs this GPU can then free the card on the server's terms.  "busy" after wait_s."""
         deadline = time.monotonic() + max(0.0, wait_s)
         while True:
-            r = self.unload()
+            r = self.unload(save=save, keep_gpu=keep_gpu, own_lease=own_lease)
             if r != "busy" or time.monotonic() >= deadline:
                 return r
             time.sleep(0.25)
 
-    def unload(self, idle_for: float | None = None) -> str:
+    def unload(self, idle_for: float | None = None, save: bool = False, keep_gpu: bool = False,
+               own_lease=None) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
-        with idle_for: one ran more recently than that) or "unsupported"."""
+        with idle_for: one ran more recently than that), "held" (local: a full suspend while another job holds a RAM-only
+        one - it would take that job's RAM back) or "unsupported".  save=True first hibernates: the engine
+        writes every parked conversation to the hibernate folder (HIBERNATE), which latches the model unloaded until
+        POST /load; "hibernate failed: ..." when that step fails (the engine is left running, nothing was saved)."""
         if not hasattr(self.engine, "unload"):
             return "unsupported"
+        if save and not self.hibernate_dir:
+            return "hibernate failed: no \"hibernate_dir\" in the run config"
+        if save and not hasattr(self.engine, "hibernate"):
+            return "hibernate failed: this engine cannot hibernate"
+        if save and keep_gpu and not hasattr(self.engine, "release"):
+            return "hibernate failed: this engine cannot give its RAM back alone (keep_gpu)"
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
+            # decided under the fifo, so a second suspend cannot slip between the check and the step (several jobs)
+            if save and keep_gpu and self.released():
+                return "unloaded"                       # already
+            if save and not keep_gpu and self.released():  # partial -> full: take the RAM back, then hibernate it all
+                if [l for l in self.lease_live() if l["id"] != own_lease]:
+                    return "held"                       # local: another job runs in that RAM: it waits for it to end
+                try:
+                    self.ensure_loaded(resume=True, force=True)
+                except (GpuBusy, RuntimeError) as e:
+                    return f"hibernate failed: {e}"
             if not self.engine.alive():
                 return "not loaded"
             with self.status_lock:
@@ -3498,28 +4246,105 @@ class Service:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
+            before = self._free_resources()              # what the engine gives back is measured against this
+            was_released = self.released()               # its RAM is already back: this unload frees only VRAM
+            if save and keep_gpu:                       # partial: the engine stays up with its VRAM
+                try:
+                    out = self.engine.release(str(self.hibernate_dir))
+                except SessionRefused as e:
+                    return f"hibernate failed: {e}"
+                except (EngineDied, EngineStuck) as e:
+                    return f"hibernate failed: {e}"
+                self.last_hibernate = out
+                self._record_resume_needs(before, hibernated=True)
+                print(f"[strata] partial hibernate: {out.get('saved')} parked conversation(s) saved to "
+                      f"{self.hibernate_dir}, {(out.get('freed') or 0) >> 20} MiB of RAM given back; the GPU keeps the "
+                      f"weights, its expert cache and the current conversation; "
+                      f"{'the next request resumes it' if self.resume_on_request else 'POST /load to resume'}",
+                      flush=True)
+                return "unloaded"
+            if save and self.disk_persist:
+                # local: QUIT writes the current conversation and the parked ones not on the disk yet (the evicted ones
+                # are there already); the latch then holds the model unloaded as for HIBERNATE
+                t0 = time.time()
+                self.engine.unload()
+                try:
+                    self._write_disk_latch()
+                except OSError as e:
+                    print(f"[strata] hibernate: the conversations are on the disk, but the latch could not be written "
+                          f"({e}); the next request starts the model", flush=True)
+                self.last_hibernate = {"mode": "disk", "ms": int((time.time() - t0) * 1000)}
+                print(f"[strata] hibernate: the engine wrote its conversations to its disk tier in "
+                      f"{time.time() - t0:.1f} s (only what was not there yet)", flush=True)
+            elif save:
+                try:
+                    out = self.engine.hibernate(str(self.hibernate_dir))
+                    self.last_hibernate = out
+                    print(f"[strata] hibernate: {out.get('saved')} conversation(s), {out.get('bytes')} bytes saved to "
+                          f"{self.hibernate_dir} in {out.get('ms', 0) / 1000:.1f} s", flush=True)
+                    if out.get("live") == 0:
+                        print("[strata] hibernate: the current conversation was NOT saved (its save was refused - see "
+                              "the engine log); it is read again from the start after resuming", flush=True)
+                except SessionRefused as e:             # the engine refused or failed it and is still in step
+                    return f"hibernate failed: {e}"
+                except (EngineDied, EngineStuck) as e:  # ended (out of step, silent, or by itself)
+                    if not self.hibernated():           # the manifest is written last: without it, nothing saved
+                        return f"hibernate failed: {e}"
+                    print(f"[strata] hibernate: {e}; the manifest was written before the engine ended: kept",
+                          flush=True)
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
-            print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
-                  "the next request loads it again", flush=True)
+            if (save or self.memory_check_on_load) and not was_released:   # else nothing reads it (or it would be low)
+                self._record_resume_needs(before, hibernated=save)
+            if save:
+                print(f"[strata] model hibernated to {self.hibernate_dir}; "
+                      f"{'the next request resumes it' if self.resume_on_request else 'POST /load to resume'}",
+                      flush=True)
+            else:
+                print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
+                      "the next request loads it again", flush=True)
             return "unloaded"
         finally:
             self.fifo.release()
 
+    def idle_step(self) -> str:
+        """One turn of the idle loop.  Local "idle_release_s": after that long without requests the engine gives its
+        RAM back and keeps the GPU (as /unload {"save": true, "keep_gpu": true}; a request resumes it in seconds).
+        "idle_unload_s": after that long it unloads altogether (with --conversation-disk-persist the engine writes
+        its conversations first).  -> what was done: "released", "unloaded" or ""."""
+        if (self.idle_release_s and self.hibernate_dir and hasattr(self.engine, "release") and self.loaded()
+                and not self.released() and not self.hibernated()):
+            r = self.unload(idle_for=self.idle_release_s, save=True, keep_gpu=True)
+            if r == "unloaded":
+                print(f"[strata] idle {self.idle_release_s:.0f} s: RAM given back (the GPU keeps the model; the next "
+                      "request resumes it)", flush=True)
+                return "released"
+        if self.idle_unload_s and (self.loaded() or self.released()):
+            if self.unload(idle_for=self.idle_unload_s) == "unloaded":
+                return "unloaded"
+        return ""
+
     def start_idle_unload(self):
-        if not self.idle_unload_s or not hasattr(self.engine, "unload"):
+        if not (self.idle_unload_s or self.idle_release_s) or not hasattr(self.engine, "unload"):
             return
-        print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
+        if self.idle_release_s:
+            print(f"[strata] the model gives its RAM back after {self.idle_release_s:.0f} s without requests "
+                  f"(keeps the GPU)", flush=True)
+        if self.idle_unload_s:
+            print(f"[strata] the model unloads after {self.idle_unload_s:.0f} s without requests", flush=True)
+        tick = max(1.0, min(30.0, min(x for x in (self.idle_unload_s, self.idle_release_s) if x) / 4))
 
         def loop():
             while True:
-                time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
+                time.sleep(tick)
                 try:
-                    self.unload(idle_for=self.idle_unload_s)
+                    self.idle_step()
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
+                except Exception as e:  # noqa: BLE001 - the idle thread must keep running
+                    print(f"[strata] idle step: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -3658,8 +4483,12 @@ class Service:
             state = "reading"
         elif s.get("busy"):
             state = "generating"
+        elif s.get("loading"):                          # local: a request is starting or resuming the engine
+            state = s["loading"]
+        elif self.released():                           # local: RAM given back, the GPU keeps the model
+            state = "suspended"
         elif not self.loaded():
-            state = "unloaded"
+            state = "hibernated" if self.hibernated() else "unloaded"
         else:
             state = "idle"
         live = {"state": state, "queued": s.get("queued", 0), "phase": s.get("phase") if s.get("busy") else None,
@@ -3670,7 +4499,9 @@ class Service:
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
-                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
+                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None,
+                "held_by": self.held_by() if state in ("suspended", "hibernated", "unloaded") else None}
+        live["requests"] = self.requests_now()             # local: who is in Strata now, and for what
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         par = int(getattr(self.engine, "batch", 0) or 0)
@@ -3743,7 +4574,7 @@ class Service:
         images = self.vision is not None
         return {
             "service": "strata", "model": self.model,
-            "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"), "hibernated": self.hibernated(),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -3769,17 +4600,42 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
+    def _effort_turns_back(self, text: str, messages: list) -> str:
+        """#458 follow-up: an earlier answer written at a non-default effort had a short system turn (EFFORT_TURN)
+        right before it; the client sends that effort back on the answer's message (strata_effort), and it goes back
+        into the rendering exactly where the engine holds it - before that answer's `<|im_start|>assistant`.  Works
+        with any chat template (the pack's own included); a message without strata_effort renders as today."""
+        if not self.effort_end or not any(isinstance(m, dict) and m.get("strata_effort") in ("low", "medium")
+                                          for m in messages):
+            return text
+        out, pos = [], 0
+        for m in ChatTemplate.kept(messages):
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            i = text.find(ASSISTANT_TURN, pos)
+            if i < 0:                                       # the template did not render this turn: leave the rest
+                break
+            out.append(text[pos:i])
+            out.append(EFFORT_TURN.format(EFFORT_TEXT[m["strata_effort"]]) if m.get("strata_effort") in ("low", "medium") else "")
+            out.append(text[i:i + len(ASSISTANT_TURN)])
+            pos = i + len(ASSISTANT_TURN)
+        out.append(text[pos:])
+        return "".join(out)
+
     def render_prompt(self, messages, tools, kwargs) -> str:
         """The template rendered.  #458: with `effort_end`, a request with a non-default effort (low, medium or no
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
-        empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn.  An earlier answer's
+        effort turn comes back with the history (message.strata_effort), so a chat that keeps a non-default effort does
+        not re-read the answer on every turn."""
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
-            return self.template.render(messages, tools=tools, **kwargs)
+            return self._effort_turns_back(self.template.render(messages, tools=tools, **kwargs), messages)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
-        history = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
+        history = self._effort_turns_back(
+            self.template.render(messages, tools=tools, add_generation_prompt=False, **base), messages)
         full = self.template.render(messages, tools=tools, add_generation_prompt=True, **kwargs)
         mine = self.template.render(messages, tools=tools, add_generation_prompt=False, **kwargs)
         if not full.startswith(mine):                  # a template this cannot take apart: rendered as asked
@@ -4146,6 +5002,15 @@ class Service:
         try:
             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
             turn = contextlib.ExitStack()
+            holding = [False]
+
+            def give_turn_back():
+                if holding[0]:                                   # the lease wait gives the turn back early: the
+                    holding[0] = False                           # callbacks left on turn then do nothing
+                    self.fifo.release()
+
+            if getattr(self.engine, "batch", 0):
+                self.this_request_is("generating")              # local: the request list
             if not getattr(self.engine, "batch", 0):
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
@@ -4155,7 +5020,9 @@ class Service:
                     while not got:
                         got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
                         if got:
-                            turn.callback(self.fifo.release)
+                            holding[0] = True
+                            turn.callback(give_turn_back)
+                            self.this_request_is("generating")      # local: the request list
                         elif cancel.is_set():
                             break
                         else:
@@ -4184,11 +5051,70 @@ class Service:
                     # waiting here for the fifo (an image encode, a /v1/vram resize) left it neither - and one on a
                     # loaded engine has nothing to start, so it does not wait for the fifo at all
                     try:
-                        if not par:
-                            self.ensure_loaded()
-                        elif not (self.loaded() and not self._vision_down()):
-                            with self.fifo:
-                                self.ensure_loaded()
+                        while True:
+                            try:
+                                if not par:
+                                    self.ensure_loaded()
+                                elif not (self.loaded() and not self._vision_down()):
+                                    with self.fifo:
+                                        self.ensure_loaded()
+                                break
+                            except GpuBusy as e:
+                                # local: a lease started in the gap between this request's load and its
+                                # generation.  Give the turn back and wait the lease out, then take the turn
+                                # again and load: the lease's end resumes the model under the fifo, so waiting
+                                # while holding it would deadlock.  A parallel request holds no turn: it waits
+                                # the lease out where it is (pings on a stream, a cancel ends it) and tries the
+                                # load again.  A GpuBusy that is not a lease answers as today.
+                                if not self.lease_holds():
+                                    raise
+                                if par:
+                                    self.this_request_is("waiting out a hold")   # local: the request list
+                                    last = time.monotonic()
+                                    while self.lease_holds() and not self.loaded():
+                                        if cancel.is_set():
+                                            with self.status_lock:
+                                                self.status["queued"] -= 1
+                                            yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0,
+                                                           "timings": None, "reasoning_tokens": 0,
+                                                           "reasoning_recoveries": 0}
+                                            return
+                                        if time.monotonic() - last >= QUEUE_BEAT_S:
+                                            yield "ping", None
+                                            last = time.monotonic()
+                                        time.sleep(1.0)
+                                    self.lease_pass_quietly()
+                                    continue
+                                give_turn_back()
+                                self.this_request_is("waiting out a hold")   # local: the request list
+                                last = time.monotonic()
+                                while self.lease_holds() and not self.loaded():
+                                    if cancel.is_set():
+                                        yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0,
+                                                       "timings": None, "reasoning_tokens": 0,
+                                                       "reasoning_recoveries": 0}
+                                        return
+                                    if time.monotonic() - last >= QUEUE_BEAT_S:
+                                        yield "ping", None
+                                        last = time.monotonic()
+                                    time.sleep(1.0)
+                                self.lease_pass_quietly()
+                                got = False
+                                while not got:
+                                    got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                                    if got:
+                                        holding[0] = True
+                                        turn.callback(give_turn_back)
+                                        self.this_request_is("generating")  # local: the request list
+                                    elif cancel.is_set():
+                                        break
+                                    else:
+                                        yield "ping", None
+                                if not got:
+                                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0,
+                                                   "timings": None, "reasoning_tokens": 0,
+                                                   "reasoning_recoveries": 0}
+                                    return
                     except BaseException:
                         if par:
                             with self.status_lock:
@@ -4415,6 +5341,13 @@ class Service:
                             finish = "stop"
                             break
                         prompt = prompt + seg + extra
+                    if thinking and finish == "stop" and not answered and not cancel.is_set():
+                        # local diagnostic: a reply that thought and then ended with no text and no call - which of
+                        # the two ends it was (parser "reasoning" with nothing held: #1053's case, reasoning_close_retry
+                        # continues it; held "</think>": #537's case, left as it is)
+                        print(f"[strata] empty answer: the reply ended after its thinking with no text or call "
+                              f"(parser={parser.state}, held={parser.buf!r}, "
+                              f"tail={self.tok.decode(raw_ids[-12:])!r})", flush=True)
                     if cancel.is_set():
                         finish = "cancel"
                     elif looped:
@@ -4613,9 +5546,245 @@ def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
 
 
+# ------------------------------------------------------------------------------------------------ detached runs
+# local: the web page's chat request outlives the page.  With "strata_run": "<id>" (the page's own, streamed) the
+# request runs to its end even when the page goes away (a reload, a closed tab): what it streams is kept, and
+# GET /v1/runs/<id> streams it again from the start, then live until the end.  POST /v1/runs/<id>/cancel stops it
+# (the page's Stop).  POST /v1/runs/<id>/message queues a message from the user: the agent gets it with its next tool
+# results (appended to the last one, so the page's history stays what the engine read) - see run_with_mcp's inbox.
+# Finished runs are kept RUN_KEEP_S.
+RUN_KEEP_S, RUN_KEEP_MAX = 3600.0, 32
+RUN_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
+
+
+class DetachedRun:
+    def __init__(self, cancel: threading.Event):
+        self.parts: list[bytes] = []
+        self.cond = threading.Condition()
+        self.done = False
+        self.cancel = cancel
+        self.ended = None
+        self.inbox: list[dict] = []
+
+    def queue(self, note_id: str, text: str) -> bool:
+        """A message from the user for the running agent; False when the run has ended (the page sends it itself)."""
+        with self.cond:
+            if self.done:
+                return False
+            self.inbox.append({"id": note_id, "text": text})
+            return True
+
+    def take(self) -> list[dict]:
+        with self.cond:
+            out, self.inbox = self.inbox, []
+            return out
+
+    def add(self, b: bytes):
+        with self.cond:
+            self.parts.append(bytes(b))
+            self.cond.notify_all()
+
+    def finish(self):
+        with self.cond:
+            self.done, self.ended = True, time.monotonic()
+            self.cond.notify_all()
+
+
+class RunTee:
+    """The handler's wfile while a detached run streams: every event is kept in the run, and written to the page
+    while it is there.  A page that went away is no error: the run goes on."""
+
+    def __init__(self, wfile, run: DetachedRun, on_gone):
+        self.wfile, self.run, self.on_gone = wfile, run, on_gone
+
+    def _lost(self):
+        self.wfile = None
+        self.on_gone()
+
+    def write(self, b):
+        if not bytes(b).startswith(b": keep-alive"):
+            self.run.add(b)
+        if self.wfile is not None:
+            try:
+                self.wfile.write(b)
+            except OSError:
+                self._lost()
+        return len(b)
+
+    def flush(self):
+        if self.wfile is not None:
+            try:
+                self.wfile.flush()
+            except OSError:
+                self._lost()
+
+
+def runs_of(svc) -> tuple[dict, threading.Lock]:
+    if not hasattr(svc, "detached_runs"):
+        svc.detached_runs, svc.detached_lock = {}, threading.Lock()
+    return svc.detached_runs, svc.detached_lock
+
+
+def run_register(svc, run_id: str, run: DetachedRun) -> DetachedRun:
+    runs, lock = runs_of(svc)
+    with lock:
+        now = time.monotonic()
+        for k in [k for k, r in runs.items() if r.done and now - r.ended > RUN_KEEP_S]:
+            del runs[k]
+        while len(runs) >= RUN_KEEP_MAX:
+            old = min((k for k, r in runs.items() if r.done), key=lambda k: runs[k].ended, default=None)
+            if old is None:
+                break
+            del runs[old]
+        runs[run_id] = run
+    return run
+
+
 # ------------------------------------------------------------------------------------------------ MCP tool loop
+# mcp.subagents (opt-in): a built-in tool that hands a task to a helper.  The helper is a fresh conversation on the same
+# engine, with the same MCP tools (not this one: no helper starts another), and only its final answer comes back as
+# the tool's result - so its searches and pages never enter the main conversation.  Helpers run one at a time: there
+# is one engine.  The main conversation waits in the conversation cache meanwhile and continues from there.
+SUBAGENT_TOOL = {
+    "name": "subagent",
+    "description": "Hand a self-contained task to a helper agent. The helper starts with a fresh, empty context, has "
+                   "the same tools as you (except this one), works on its own, and returns only its final report, so "
+                   "its searches and pages stay out of this conversation. Use it for independent research threads, "
+                   "or to have a helper argue one side of a question; call it again for each further helper (they "
+                   "run one after another). The helper sees nothing of this chat: put everything it needs in `task` "
+                   "(the question, names, constraints, what its report should contain). Each report ends with the "
+                   "helper's id: to have that helper keep going (it stopped early, or you want more), call this tool "
+                   "with `continue` set to that id and `task` saying what to do next; it keeps everything it found.",
+    "parameters": {"type": "object", "properties": {
+        "task": {"type": "string", "description": "The complete task for the helper."},
+        "label": {"type": "string", "description": "A short label for the helper, e.g. 'advocate for option A'."},
+        "continue": {"type": "string", "description": "The id of an earlier helper (from the end of its report), "
+                                                      "to have it keep going with `task` as its next instruction."}},
+        "required": ["task"]}}
+SUBAGENT_SYSTEM = ("You are a helper agent. Another agent gave you the task below; you do not see its conversation. "
+                   "Do the task with the tools you have. Then answer with a self-contained report: what you found or "
+                   "concluded, the key facts and numbers with their sources (URLs), and how sure you are. Your final "
+                   "answer is passed back to the other agent as it is, and it is all that agent will see.")
+USER_NOTE_HEAD = "\n\n[A message from the user, sent while you were working - take it into account now:]\n"
+SUBAGENT_KEEP = 16                     # helpers whose conversation is kept for `continue` (the most recent)
+
+
+def _helpers(svc) -> dict:
+    if not hasattr(svc, "subagent_helpers"):
+        svc.subagent_helpers = {}
+    return svc.subagent_helpers
+
+
+SUBAGENT_WRAP_UP = ("not run: you have used all your tool calls. Do not call any more tools. Write your final report "
+                    "now from what you have found so far, and say what you could not check.")
+
+
+def run_subagent(svc: Service, hub, call, tools, kw, max_req, sampling, cancel, mcp_names):
+    """One `subagent` call: a fresh conversation with the task, run through run_with_mcp without this tool.  Yields
+    pings and ("mcp", {"event": "progress", ...}) for the call's block in the web app; returns the result as
+    hub.call does, or None when the request was cancelled."""
+    t0 = time.monotonic()
+    args = call.arguments if isinstance(call.arguments, dict) else {}
+    task = args.get("task")
+
+    def result(text, ok=True):
+        cap, full = int(hub.settings["max_result_chars"]), len(text)
+        if cap > 0 and full > cap:
+            text = text[:cap] + f"\n\n[... truncated: the helper wrote {full:,} characters; only the first {cap:,} are shown]"
+        return {"ok": ok, "text": text, "chars": full, "truncated": cap > 0 and full > cap,
+                "ms": int((time.monotonic() - t0) * 1000)}
+
+    if not isinstance(task, str) or not task.strip():
+        return result("error: `task` must be the helper's task, as text", ok=False)
+    sub_tools = [t for t in tools or [] if t.get("name") != SUBAGENT_TOOL["name"]]
+    sub_names = set(mcp_names) - {SUBAGENT_TOOL["name"]}
+    helpers = _helpers(svc)
+    helper_id = args.get("continue")
+    if helper_id is not None:
+        if not isinstance(helper_id, str) or helper_id.strip() not in helpers:
+            return result(f"error: there is no helper {helper_id!r} to continue (known: "
+                          f"{', '.join(helpers) or 'none'}); start a new one without `continue`", ok=False)
+        helper_id = helper_id.strip()
+        messages = list(helpers[helper_id]) + [{"role": "user", "content": task.strip()}]
+    else:
+        helper_id = "h-" + uuid.uuid4().hex[:6]
+        messages = [{"role": "system", "content": SUBAGENT_SYSTEM}, {"role": "user", "content": task.strip()}]
+    try:
+        ids, thinking, max_new = svc.prepare(messages, sub_tools or None, kw, max_req, cancel=cancel)
+    except ClientGone:
+        return None
+    except ValueError as e:
+        return result(f"error: the helper could not start: {e}", ok=False)
+    yield "mcp", {"event": "progress", "id": call.id, "text": "reading the task"}
+    final, final_reasoning, everything, pieces, finish, last_note, limited = [], [], [], 0, None, 0.0, None
+    kept = []                                            # its conversation at the end (run_with_mcp fills it)
+    run = run_with_mcp(svc, hub, messages, sub_tools or None, kw, ids, thinking, max_new, max_req, sampling, cancel,
+                       sub_names, wrap_up=True, max_rounds=hub.settings.get("subagent_max_rounds"), keep=kept)
+    full = None
+    while True:
+        try:
+            kind, x = next(run)
+        except StopIteration:
+            break
+        except ValueError as e:              # its context filled up (a prompt too long): return what it has so far
+            full = str(e)
+            break
+        if kind == "done":
+            finish = x.get("finish")
+        elif kind == "mcp":
+            if x.get("event") == "limit":
+                limited, final, final_reasoning = x.get("max_rounds"), [], []   # what it wrote before the calls not run was not its report
+                yield "mcp", {"event": "progress", "id": call.id, "text": f"tool limit ({limited}) reached: writing its report"}
+            elif x.get("event") == "call":
+                final, final_reasoning = [], []              # what it wrote before a tool call was not its report
+                brief = json.dumps(x.get("arguments") or {}, ensure_ascii=False)
+                yield "mcp", {"event": "progress", "id": call.id,
+                              "text": f"{x.get('tool') or x.get('name')} {brief[:160]}"}
+        elif kind == "event" and x.kind in ("content", "reasoning"):
+            if x.kind == "content":
+                final.append(x.text)
+                everything.append(x.text)
+            else:
+                final_reasoning.append(x.text)
+            pieces += 1
+            if time.monotonic() - last_note >= 2.0:           # a piece streams every ~15 ms: say so now and then
+                last_note = time.monotonic()
+                yield "mcp", {"event": "progress", "id": call.id,
+                              "text": f"{'writing' if x.kind == 'content' else 'thinking'} ({pieces:,} pieces)"}
+        elif kind == "ping":
+            yield "ping", None
+    if cancel.is_set():
+        return None
+    if finish == "cancel":                                # the helper's own run ended early, not the request: say so
+        notes = "".join(everything).strip()
+        print(f"[strata] subagent {helper_id}: its run ended early (finish=cancel) without the request being stopped",
+              flush=True)
+        return result((notes + "\n\n" if notes else "") + "[the helper's run ended early, before its report]",
+                      ok=bool(notes))
+    report = "".join(final).strip() or "".join(everything).strip()
+    if full:
+        notes = "".join(everything).strip()                  # no report: everything it wrote is what there is
+        return result((notes + "\n\n" if notes else "") + f"[the helper stopped before its report: {full}]",
+                      ok=bool(notes))
+    if not report:
+        return result("error: the helper ended without a report", ok=False)
+    if kept:                                             # kept for `continue`: its conversation and its report
+        reasoning = "".join(final_reasoning).strip()
+        helpers.pop(helper_id, None)                     # the most recent last
+        helpers[helper_id] = kept + [{"role": "assistant", "content": report,
+                                      **({"reasoning_content": reasoning} if reasoning else {})}]
+        while len(helpers) > SUBAGENT_KEEP:
+            helpers.pop(next(iter(helpers)))
+    if limited:
+        key = "mcp.subagent_max_rounds" if hub.settings.get("subagent_max_rounds") else "mcp.max_rounds"
+        report += f"\n\n[the helper reached its limit of {limited} tool rounds ({key}) and wrote this from what it had found]"
+    if kept:
+        report += f"\n\n[helper id: {helper_id} - to have it keep going, call subagent with continue: \"{helper_id}\"]"
+    return result(report)
+
+
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names):
+                 mcp_names, wrap_up=False, max_rounds=None, keep=None, inbox=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -4624,9 +5793,13 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
     could not reach the model before the client's)."""
-    max_rounds = int(hub.settings["max_rounds"])
-    total, rounds, done = 0, 0, None
+    max_rounds = int(max_rounds or hub.settings["max_rounds"])
+    total, rounds, done, wrapped = 0, 0, None, False
     messages = list(messages)
+    # #458 follow-up: this request's non-default effort (its effort turn sits before every round's answer, so each
+    # round's assistant message carries it and the next round renders that turn back where the engine holds it)
+    effort = kw.get("reasoning_effort") if kw.get("enable_thinking") is not False else None
+    effort = {"strata_effort": effort} if effort in ("low", "medium") else {}
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
         for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel):
@@ -4650,6 +5823,25 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             yield kind, x
         total += done["completion_tokens"]
         run_them = calls and not own_calls and done["finish"] == "stop" and not cancel.is_set()
+        if run_them and rounds >= max_rounds and wrap_up and not wrapped:
+            # wrap_up (a helper): at the limit its calls are answered "not run" and it gets one more turn to write its
+            # report from what it found - stopping here would return only the notes it wrote before those calls
+            wrapped = True
+            yield "mcp", {"event": "limit", "max_rounds": max_rounds}
+            for c in calls:
+                yield "mcp", {"event": "result", "id": c.id, "ok": False, "skipped": True, "text": "not run",
+                              "chars": 0, "truncated": False, "ms": 0}
+            messages.append({"role": "assistant", "content": "".join(text).strip(),
+                             **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
+                             **effort,
+                             "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
+            messages += [{"role": "tool", "content": SUBAGENT_WRAP_UP} for _ in calls]
+            try:
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
+            except ClientGone:
+                done = {**done, "finish": "cancel"}
+                break
+            continue
         if run_them and rounds >= max_rounds:
             yield "mcp", {"event": "limit", "max_rounds": max_rounds}
             run_them = False
@@ -4660,21 +5852,55 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             break
         rounds += 1
         results = []
-        for c in calls:
-            s, tool = hub.routes().get(c.name, (None, c.name))
-            yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
-                          "tool": tool, "arguments": c.arguments, "round": rounds}
-            # The call runs on a thread while this generator keeps yielding heartbeats: they reach the client as
-            # keep-alives, which is how a client that went away (the web app's Stop) is noticed during a slow tool.
+
+        def start(c):
+            """Run one MCP call on a thread: this generator keeps yielding heartbeats meanwhile, which reach the client
+            as keep-alives - how a client that went away (the web app's Stop) is noticed during a slow tool."""
             box = {}
 
-            def work(c=c, box=box):
+            def work():
                 try:
                     box["r"] = hub.call(c.name, c.arguments, cancel)
                 except McpCancelled:
                     box["cancelled"] = True
+                except Exception as e:  # noqa: BLE001 - any other failure is the tool's error, not the end of the answer
+                    import traceback
+                    print(f"[strata] tool {c.name} failed: {type(e).__name__}: {e}\n{traceback.format_exc()}", flush=True)
+                    text = f"error: the tool failed ({type(e).__name__}: {e})"
+                    box["r"] = {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0}
             worker = threading.Thread(target=work, daemon=True)
             worker.start()
+            return worker, box
+
+        def announce(c):
+            s, tool = hub.routes().get(c.name, (None, c.name))
+            return "mcp", {"event": "call", "id": c.id, "name": c.name, "server": s.name if s else None,
+                           "tool": tool, "arguments": c.arguments, "round": rounds}
+
+        # A round's MCP calls run at the same time (the model often asks for several pages at once): the round waits
+        # for the slowest, not their sum.  The results still go back in the order the calls were written.  A round
+        # with a helper keeps one call at a time: a helper runs on the engine.
+        running = {}
+        if len(calls) > 1 and not any(c.name == SUBAGENT_TOOL["name"] for c in calls):
+            for c in calls:
+                yield announce(c)
+                running[c.id] = start(c)
+        for c in calls:
+            if c.name == SUBAGENT_TOOL["name"]:
+                yield "mcp", {"event": "call", "id": c.id, "name": c.name, "server": "helper", "tool": c.name,
+                              "arguments": c.arguments, "round": rounds}
+                r = yield from run_subagent(svc, hub, c, tools, kw, max_req, sampling, cancel, mcp_names)
+                if r is None:
+                    break
+                print(f"[strata] subagent: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
+                      f"{r['ms'] / 1000:.1f} s", flush=True)
+                results.append(r["text"])
+                yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
+                continue
+            if c.id not in running:
+                yield announce(c)
+                running[c.id] = start(c)
+            worker, box = running[c.id]
             try:
                 while worker.is_alive():
                     worker.join(1.0)
@@ -4690,11 +5916,20 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             results.append(r["text"])
             yield "mcp", {"event": "result", "id": c.id, **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
+        if inbox is not None and results and len(results) == len(calls) and not cancel.is_set():
+            # messages the user sent while the agent worked: they go in with this round's results, so the agent takes
+            # them into account at once (appended to the last result: the page appends them to it too)
+            notes = inbox.take()
+            if notes:
+                note = USER_NOTE_HEAD + "\n\n".join(n["text"] for n in notes)
+                results[-1] += note
+                yield "mcp", {"event": "user_note", "id": calls[-1].id, "text": note, "notes": [n["id"] for n in notes]}
         if cancel.is_set() or len(results) < len(calls):
             done = {**done, "finish": "cancel"}
             break
         messages.append({"role": "assistant", "content": "".join(text).strip(),
                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
+                         **effort,
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
         messages += [{"role": "tool", "content": r} for r in results]
         try:
@@ -4702,6 +5937,8 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         except ClientGone:                                      # #1999: the client left while a picture was prepared
             done = {**done, "finish": "cancel"}
             break
+    if keep is not None:
+        keep[:] = messages                                       # the conversation as the last round read it
     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
 
 
@@ -4967,6 +6204,29 @@ def anthropic_collect(events) -> dict:
     return msg
 
 
+# ------------------------------------------------------------------------------------------------ documents
+CONVERT_EXT = (".pdf", ".docx", ".xlsx", ".pptx")
+MAX_CONVERT_BYTES = 50 * 1024 * 1024                  # the file itself; its base64 in the request is 4/3 of that
+
+
+def convert_document(name: str, data: bytes) -> str:
+    """The text of a PDF / Word / Excel / PowerPoint file as Markdown, for the web app's attach button.  MarkItDown is
+    optional (pip install "markitdown[pdf,docx,xlsx,pptx]"): RuntimeError without it, ValueError for another type.
+    A scanned PDF has no text layer and gives (almost) nothing - there is no OCR here."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext not in CONVERT_EXT:
+        raise ValueError(f"{name}: only {', '.join(CONVERT_EXT)} files are converted")
+    try:
+        from markitdown import MarkItDown, StreamInfo
+    except ImportError:
+        raise RuntimeError('reading documents needs MarkItDown: .venv\\Scripts\\python -m pip install '
+                           '"markitdown[pdf,docx,xlsx,pptx]", then restart Strata') from None
+    import io
+    result = MarkItDown(enable_plugins=False).convert_stream(io.BytesIO(data),
+                                                              stream_info=StreamInfo(extension=ext, filename=name))
+    return result.markdown
+
+
 # ------------------------------------------------------------------------------------------------ HTTP
 CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding: chunked body may hold (read into memory)
 
@@ -5004,6 +6264,7 @@ def make_handler(svc: Service):
 
         def handle_one_request(self):
             self.answer_started = False
+            self.key_scope = "full"                         # set again by _authorized for each request
             super().handle_one_request()
             self._drain_body()
 
@@ -5236,12 +6497,31 @@ def make_handler(svc: Service):
             self.end_headers()
             self.wfile.write(body)
 
+        key_scope = "full"                                  # local: "model" for a model-only key (svc.model_keys)
+
+        def _full_key_quietly(self) -> bool:
+            """local: this request carries a full key (or the server has no key) - checked without answering 401."""
+            if not svc.api_key:
+                return True
+            auth = self.headers.get("Authorization", "")
+            given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+            return key_matches(given, svc.api_key) and not (svc.model_keys and key_matches(given, svc.model_keys))
+
         def _authorized(self) -> bool:
             if not svc.api_key:
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
             if key_matches(given, svc.api_key):
+                self.key_scope = "model" if svc.model_keys and key_matches(given, svc.model_keys) else "full"
+                if self.key_scope == "model":
+                    path = self.path.split("?")[0].rstrip("/")
+                    allowed = MODEL_KEY_GET if self.command == "GET" else MODEL_KEY_POST
+                    lease_path = path == "/lease" or path.startswith("/lease/")   # the wrapper's own lease: the
+                    if path not in allowed and not lease_path:                    # body decides (model_key_control_ok)
+                        self._json(403, {"error": {"type": "permission_error",
+                                                   "message": f"this key may use the model only, not {path}"}})
+                        return False
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -5335,10 +6615,20 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
             elif path in ("/health", "/api/health"):
+                # local: who is working (session titles, a helper's task) and what holds the model (job commands,
+                # folders) only for a full key - /health needs no key, and a model-only key is another account's
+                who = self._full_key_quietly()
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None,
-                                 "loaded": svc.loaded(), "service": "strata"})
+                                 "loaded": svc.loaded(), "hibernated": svc.hibernated(), "released": svc.released(),
+                                 **svc.resume_status(),
+                                  "leases": svc.lease_live(),
+                                  **({"held_by": h} if (h := svc.held_by()) else {}),
+                                  **({"requests": r} if who and (r := svc.requests_now()) else {}),
+                                  "service": "strata"})
+            elif path == "/leases":                          # local: the live leases (serve/leases.py)
+                self._json(200, {"leases": svc.lease_live()})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
                 f = svc.images.file(path[len("/v1/images/files/"):]) if svc.images is not None else None
@@ -5366,6 +6656,23 @@ def make_handler(svc: Service):
                 for k in ("started", "first_token"):
                     s.pop(k, None)
                 self._json(200, s)
+            elif path == "/v1/chat-store":                   # local: the chat shared by every device (chat_dir)
+                if self._authorized():
+                    store = getattr(svc, "chat_store", None)
+                    if self._foreign_origin():
+                        self._json(403, {"error": {"message": "the chat only from Strata's own page"}})
+                    elif store is None:
+                        self._json(404, {"error": {"message": "no chat_dir: the chat stays in each browser"}})
+                    else:
+                        have = (parse_qs(urlsplit(self.path).query).get("v") or [""])[0]
+                        quick = have.isdigit() and int(have) == store.state(messages=False)["version"]
+                        self._json(200, store.state(messages=not quick))   # unchanged: only the version
+            elif path.startswith("/v1/runs/"):
+                if self._authorized():
+                    if self._foreign_origin():
+                        self._json(403, {"error": {"message": "runs only from Strata's own page"}})
+                    else:
+                        self._run_attach(path[len("/v1/runs/"):])
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     loaded = svc.loaded()
@@ -5430,32 +6737,106 @@ def make_handler(svc: Service):
             if path == "/config":
                 self._config_post()
                 return
-            if path in ("/unload", "/load") and not self._control_body():
+            if path == "/convert":
+                self._convert()
                 return
+            if path == "/restart":
+                self._restart()
+                return
+            control = {}
+            lease_path = path == "/lease" or path.startswith("/lease/")   # local: the lease API (serve/leases.py)
+            if path == "/hold":                            # local: the pid holds are gone: the lease is the only lock
+                if self._control_body() is None:
+                    return
+                self._json(410, {"error": {"message": "the pid holds are gone: the lease is the only lock - hold the "
+                                               "model with POST /lease (see tools/strata_suspend.py run)"}})
+                return
+            ctl = path in ("/unload", "/load") or lease_path
+            if ctl:
+                raw = self._control_body()
+                if raw is None:
+                    return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
-            if path in ("/unload", "/load") and not self._own_page("the model can be loaded or unloaded"):
+            if ctl and not self._own_page("the model can be loaded or unloaded"):
                 return
+            if ctl and raw.strip():
+                try:
+                    control = json.loads(raw)
+                except ValueError:
+                    control = None
+                if not isinstance(control, dict):
+                    self._json(400, {"error": {"message": "send a JSON object"}})
+                    return
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
+                return
+            if self.key_scope == "model" and (path == "/unload" or lease_path) and \
+                    not model_key_control_ok(path, control):
+                self._json(403, {"error": {"type": "permission_error", "message": "this key may only hold the model "
+                                           "for its own job (the suspend wrapper), not change it otherwise"}})
+                return
+            if path == "/unload" and "hold" + "_pids" in control:   # local: the pid holds are gone (field presence)
+                self._json(400, {"error": {"message": "the pid holds are gone: hold the model with a lease "
+                                               "(POST /lease, see tools/strata_suspend.py run)"}})
+                return
+            if lease_path:                               # local: the lease API (serve/leases.py)
+                self._lease_routes(path, control)
                 return
             if path == "/unload":                            # give the GPU back now (between requests)
                 try:
                     wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
                                          svc.UNLOAD_WAIT_S)
-                    r = svc.unload_waiting(wait_s) if wait_s else svc.unload()
+                    save, keep_gpu = control.get("save") is True, control.get("keep_gpu") is True
                 except EngineStuck as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                self._json(409 if r == "busy" else 200, {"status": r})
+                try:
+                    r = (svc.unload_waiting(wait_s, save=save, keep_gpu=keep_gpu) if wait_s
+                         else svc.unload(save=save, keep_gpu=keep_gpu))
+                except EngineStuck as e:
+                    r = f"hibernate failed: {e}"
+                if save and r in ("unloaded", "not loaded"):
+                    svc.lease_drop_pending_resume()      # a deliberate hibernate: no pending resume brings it back
+                if r.startswith("hibernate failed"):
+                    self._json(503, {"error": {"type": "server_error", "message": r}})
+                    return
+                if r == "held":                              # local: wait for the RAM-only job(s) to end, then retry
+                    self._json(409, {"status": "held", "leases": svc.lease_live(),
+                                     "error": {"message": "a job holds a RAM-only suspend: a full one would take its "
+                                                          "RAM back; retry when it has ended"}})
+                    return
+                saved = r == "unloaded" and save
+                if saved:
+                    svc.lease_checkpoint()                   # local: the conversations go to disk with the hold
+                partial = saved and keep_gpu
+                live_lost = saved and (svc.last_hibernate or {}).get("live") == 0
+                self._json(409 if r == "busy" else 200, {"status": r, **({"hibernated": True} if saved else {}),
+                                                         **({"kept": "gpu"} if partial else {}),
+                                                         **({"live_saved": False} if live_lost else {})})
                 return
             if path == "/load":                              # load now, e.g. ahead of a request
+                if control.get("force") is True:
+                    svc.lease_override_all()                 # local: those leases end "overridden"
+                elif svc.lease_holds():                      # local: a lease holds it: 409, not 503
+                    self._json(409, {"status": "held", "leases": svc.lease_live(),
+                                     "error": {"message": "a job holds the model with a lease: it resumes by itself "
+                                                          "when the job ends. POST /load {\"force\": true} loads it "
+                                                          "anyway"}})
+                    return
+                if control.get("fresh") is True and svc.hibernate_dir:
+                    err = svc.discard_hibernate()
+                    if err:                                  # loading now would restore what was to be discarded
+                        self._json(500, {"error": {"type": "server_error", "message": err}})
+                        return
                 try:
-                    svc.load()
+                    svc.load(resume=True, force=control.get("force") is True)
                     self._json(200, {"status": "loaded"})
                 except GpuBusy as e:
                     ra = getattr(e, "retry_after", None)
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                                headers={"Retry-After": int(ra)} if ra else None)
+                except RuntimeError as e:                    # the engine did not start: say so instead of hanging up
+                    self._json(503, {"error": {"type": "server_error", "message": f"the engine did not start: {e}"}})
                 return
             try:
                 req = json.loads(self._body() or b"{}")
@@ -5474,9 +6855,16 @@ def make_handler(svc: Service):
                     if path == "/v1/unload":
                         wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
                                              svc.UNLOAD_WAIT_S)
-                        result = svc.unload_waiting(wait_s) if wait_s else svc.unload()
-                        if result == "busy":
-                            raise ModelBusy("a request is running or queued")
+                        save, keep_gpu = req.get("save") is True, req.get("keep_gpu") is True
+                        result = (svc.unload_waiting(wait_s, save=save, keep_gpu=keep_gpu) if wait_s
+                                  else svc.unload(save=save, keep_gpu=keep_gpu))
+                        if result in ("busy", "held"):
+                            raise ModelBusy("a request is running or queued" if result == "busy" else
+                                            "a job holds a RAM-only suspend; retry when it has ended")
+                        if save and result in ("unloaded", "not loaded"):
+                            svc.lease_drop_pending_resume()   # a deliberate hibernate: no pending resume brings it back
+                        if result.startswith("hibernate failed"):
+                            raise GpuBusy(result)
                     else:
                         if not svc.fifo.acquire(blocking=False):
                             raise ModelBusy("a request is running or queued")
@@ -5484,12 +6872,61 @@ def make_handler(svc: Service):
                             with svc.status_lock:
                                 if svc.status.get("busy") or svc.status.get("queued"):
                                     raise ModelBusy("a request is running or queued")
-                            svc.ensure_loaded()
+                            if req.get("fresh") is True and svc.hibernate_dir:
+                                err = svc.discard_hibernate()
+                                if err:
+                                    self._json(500, {"error": {"type": "server_error", "message": err}})
+                                    return
+                            svc.ensure_loaded(resume=True, force=req.get("force") is True)
                             svc.last_request_at = time.time()
                         finally:
                             svc.fifo.release()
                         result = "loaded"
                     self._json(200, {"status": result, **svc.v1_status()})
+                    return
+                if path == "/v1/chat-store":                 # local: save the shared chat (chat_dir)
+                    if not self._own_page("the chat can be saved"):
+                        return
+                    store = getattr(svc, "chat_store", None)
+                    if store is None:
+                        self._json(404, {"error": {"message": "no chat_dir: the chat stays in each browser"}})
+                        return
+                    base, msgs = req.get("version"), req.get("messages")
+                    if not isinstance(base, int) or isinstance(base, bool) or not isinstance(msgs, list):
+                        raise ValueError('send {"version": <the version it was made from>, "messages": [...]}')
+                    ok, state = store.save(base, msgs, archive=req.get("archive") is True)
+                    self._json(200 if ok else 409, state)
+                    return
+                if path == "/v1/subagent":                   # local: the page's Run on a helper block
+                    if not self._own_page("helpers can be run"):
+                        return
+                    self._run_helper(req)
+                    return
+                if path.startswith("/v1/runs/") and path.endswith("/message"):   # local: a message for the running agent
+                    if not self._own_page("messages can be queued"):
+                        return
+                    runs, lock = runs_of(svc)
+                    with lock:
+                        run = runs.get(path[len("/v1/runs/"):-len("/message")])
+                    text, note_id = req.get("text"), req.get("id")
+                    if not isinstance(text, str) or not text.strip() or not isinstance(note_id, str):
+                        raise ValueError('send {"id": "...", "text": "..."}')
+                    if run is None or not run.queue(note_id, text.strip()):
+                        self._json(409, {"status": "ended", "message": "the run has ended: send it as a new message"})
+                        return
+                    self._json(200, {"status": "queued"})
+                    return
+                if path.startswith("/v1/runs/") and path.endswith("/cancel"):   # local: the page's Stop for a run
+                    if not self._own_page("runs can be stopped"):
+                        return
+                    runs, lock = runs_of(svc)
+                    with lock:
+                        run = runs.get(path[len("/v1/runs/"):-len("/cancel")])
+                    if run is None:
+                        self._json(404, {"error": {"message": "no such run"}})
+                        return
+                    run.cancel.set()
+                    self._json(200, {"status": "cancelled" if not run.done else "ended"})
                     return
                 if path == "/v1/vram":                       # #533: give VRAM back to other programs, or take it
                     if not self._own_page("the VRAM reserve can be changed"):
@@ -5503,9 +6940,12 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    if self.key_scope == "model" and isinstance(req, dict):   # local: no server-side tools for it
+                        for k in MODEL_KEY_DROPPED:
+                            req.pop(k, None)
                     self.record = svc.begin_request(path, req)
-                if path == "/v1/responses":
-                    self._responses(req)
+                    with svc.agent_request(self.headers, path) as self.agent_sid:   # local: who is working
+                        self._chat_route(path, req)
                 elif path.startswith("/slots/"):
                     query = parse_qs(self.path.partition("?")[2])
                     try:
@@ -5515,10 +6955,6 @@ def make_handler(svc: Service):
                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
                                                      "the engine again", "type": "server_error"}}
                     self._json(code, body)
-                elif path == "/v1/chat/completions":
-                    self._openai(req)
-                elif path == "/v1/messages":
-                    self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
                 elif path == "/v1/images/generations":
@@ -5631,32 +7067,34 @@ def make_handler(svc: Service):
                 props["build_info"] = "Strata " + str(version)
             self._json(200, props)
 
-        def _control_body(self) -> bool:
-            """Consume the unused control body before replying/closing (Windows otherwise sends a TCP reset)."""
+        def _control_body(self) -> bytes | None:
+            """Read the control request's body - all of it, so Windows does not send a TCP reset - and return it
+            (/unload {"save": true}, /load {"fresh": true}).  None when it was invalid (a reply was already sent)."""
             if self._chunked():
                 self.body_read = True
                 try:
                     self.connection.settimeout(2.0)
-                    self._read_chunked(65536, keep=False)
+                    return self._read_chunked(65536)
                 except BadBody as e:
                     self._json(e.status, {"error": {"message": f"control request: {e}"}})
-                    return False
+                    return None
                 except OSError:
                     self._json(400, {"error": {"message": "incomplete control request body"}})
-                    return False
-                return True
+                    return None
             try:
                 length = int(self.headers.get("Content-Length", "0"))
             except ValueError:
                 self._json(400, {"error": {"message": "invalid Content-Length"}})
-                return False
+                return None
             if not 0 <= length <= 65536:
                 self._json(413, {"error": {"message": "control request body is limited to 64 KiB"}})
-                return False
+                return None
             timeout = self.connection.gettimeout()
+            raw = b""
             try:
                 self.connection.settimeout(2.0)
-                complete = len(self.rfile.read(length)) == length
+                raw = self.rfile.read(length) if length else b""
+                complete = len(raw) == length
             except OSError:
                 complete = False
             finally:
@@ -5664,7 +7102,162 @@ def make_handler(svc: Service):
                 self.body_read = True                    # nothing left for the drain to wait for (#594)
             if not complete:
                 self._json(400, {"error": {"message": "incomplete control request body"}})
-            return complete
+                return None
+            return raw
+
+        def _lease_routes(self, path, control):
+            """local: the lease API (serve/leases.py): POST /lease creates a lease and suspends the model for it
+            (the way /unload {"save": true[, "keep_gpu": true]} does); /lease/<id>/renew keeps it alive (an unknown
+            id becomes a lease, an ended one is 410); /lease/<id>/end ends it."""
+            from serve.leases import LeaseEnded
+            if path == "/lease":
+                mode = control.get("mode")
+                if mode not in ("full", "ram"):
+                    self._json(400, {"error": {"message": "mode: \"full\" or \"ram\""}})
+                    return
+                session = control.get("session")
+                if session is not None and not isinstance(session, dict):
+                    self._json(400, {"error": {"message": "session: {\"agent\", \"id\"} or null"}})
+                    return
+                log = control.get("log")
+                if "log" in control and log is not None and not isinstance(log, str):
+                    self._json(400, {"error": {"message": "log: a path string or null"}})
+                    return
+                try:
+                    t = svc.lease_table()
+                except (ValueError, OSError) as e:
+                    self._json(503, {"error": {"type": "server_error", "message": f"the lease table: {e}"}})
+                    return
+                svc._lease_create_lock.acquire()               # two /lease at once: the second waits for the first's
+                try:                                           # suspend (else it sees that one in progress: "busy")
+                    was_loaded = svc.lease_model_loaded()      # the engine was running when this request came (a
+                                                                 # RAM-only release before the job stays as it is)
+                    lease = t.create(cmd=control.get("cmd"), cwd=control.get("cwd"), mode=mode, session=session,
+                                     model_loaded=was_loaded, log=log)  # the lease goes in BEFORE the engine stops
+                    r = svc.unload(save=True, keep_gpu=(mode == "ram"), own_lease=lease["id"])
+                finally:
+                    svc._lease_create_lock.release()
+                if r not in ("unloaded", "not loaded"):        # not suspended: the lease goes again
+                    try:
+                        t.end(lease["id"])
+                    except KeyError:
+                        pass
+                    if r == "busy":
+                        self._json(409, {"status": "busy", "error": {"message": "a request is running or queued"}})
+                    elif r == "held":
+                        self._json(409, {"status": "held", "leases": svc.lease_live(),
+                                         "error": {"message": "a job holds a RAM-only suspend: a full one would take "
+                                                              "its RAM back; retry when it has ended"}})
+                    else:
+                        self._json(503, {"error": {"type": "server_error", "message": r}})
+                    return
+                if r == "unloaded":
+                    svc.lease_checkpoint()                     # the conversations went to disk with the lease
+                self._json(200, {"id": lease["id"], "status": r, "lease": t.get(lease["id"])})
+                return
+            lid = path[len("/lease/"):]
+            if lid == "session-woken":                     # the waker told a session of the checkpoint's register
+                agent, sid = control.get("agent"), control.get("id")
+                if set(control) != {"agent", "id"} or agent not in ("opencode", "claude") or \
+                        not isinstance(sid, str) or not sid:
+                    self._json(400, {"error": {"message": "session-woken: {\"agent\": \"opencode\"|\"claude\", "
+                                                   "\"id\": \"<session id>\"}"}})
+                    return
+                try:
+                    t = svc.lease_table()
+                except (ValueError, OSError) as e:
+                    self._json(503, {"error": {"type": "server_error", "message": f"the lease table: {e}"}})
+                    return
+                t.mark_session_woken(agent, sid)
+                self._json(200, {"agent": agent, "id": sid, "woken": True})
+                return
+            if lid == "stop":                              # POST /lease/stop {"all": true}: every live lease ends
+                if set(control) != {"all"} or control.get("all") is not True:
+                    self._json(400, {"error": {"message": "stop: send {\"all\": true}"}})
+                    return
+                try:
+                    t = svc.lease_table()
+                except (ValueError, OSError) as e:
+                    self._json(503, {"error": {"type": "server_error", "message": f"the lease table: {e}"}})
+                    return
+                stopped = t.stop_all()
+                svc.lease_pass()                           # the last one out brings the model back (if loaded)
+                self._json(200, {"stopped": stopped})
+                return
+            verb = ""
+            if lid.endswith("/renew"):
+                lid, verb = lid[:-len("/renew")], "renew"
+            elif lid.endswith("/end"):
+                lid, verb = lid[:-len("/end")], "end"
+            elif lid.endswith("/woken"):
+                lid, verb = lid[:-len("/woken")], "woken"
+            elif lid.endswith("/stop"):
+                lid, verb = lid[:-len("/stop")], "stop"
+            if not verb or len(lid) != 32 or any(c not in "0123456789abcdef" for c in lid):
+                self._json(404, {"error": {"message": "no such lease route"}})
+                return
+            try:
+                t = svc.lease_table()
+            except (ValueError, OSError) as e:
+                self._json(503, {"error": {"type": "server_error", "message": f"the lease table: {e}"}})
+                return
+            if verb == "renew":
+                try:
+                    self._json(200, t.renew(lid))
+                except LeaseEnded as e:
+                    self._json(410, {"error": {"message": str(e)}})
+                return
+            if verb == "woken":                            # the waker told this lease's session: mark it, 200 again
+                try:
+                    self._json(200, t.mark_woken(lid))
+                except KeyError:
+                    self._json(404, {"error": {"message": f"no lease {lid}"}})
+                return
+            if verb == "stop":                             # the user ends this lease: it ends "stopped"
+                try:
+                    lease = t.stop(lid)
+                except KeyError:
+                    self._json(404, {"error": {"message": f"no lease {lid}"}})
+                    return
+                svc.lease_pass()                           # the last one out brings the model back (if loaded)
+                self._json(200, lease)
+                return
+            exit_ = control.get("exit")
+            if "exit" in control and exit_ is not None and (isinstance(exit_, bool) or not isinstance(exit_, int)):
+                self._json(400, {"error": {"message": "exit: a whole number or null"}})
+                return
+            try:
+                lease = t.end(lid, exit=exit_)
+            except KeyError:
+                self._json(404, {"error": {"message": f"no lease {lid}"}})
+                return
+            svc.lease_pass()                                   # the last one out brings the model back (if loaded)
+            self._json(200, lease)
+
+        def _restart(self):
+            """local: POST /restart (full key only: a model-only key is refused before this): save the conversations
+            (hibernate, when a hibernate folder is set and the model runs), answer, then end the server with
+            RESTART_EXIT_CODE - tools/strata_service.py starts it again at once, on the code now in the folder. A
+            deploy needs no administrator then. Refused (503) when the save fails: nothing would come back."""
+            if self._control_body() is None:
+                return
+            if not self._own_page("Strata can be restarted"):
+                return
+            saved = "not loaded"
+            if svc.hibernate_dir and (svc.loaded() or svc.released()):
+                try:
+                    saved = svc.unload_waiting(svc.UNLOAD_WAIT_S, save=True)
+                except EngineStuck as e:
+                    saved = f"hibernate failed: {e}"
+                if saved not in ("unloaded", "not loaded"):
+                    self._json(503, {"error": {"type": "server_error", "message": f"not restarted: the conversations "
+                                               f"could not be saved first ({saved})"}})
+                    return
+            elif svc.loaded():
+                saved = "not saved (no hibernate_dir)"
+            print(f"[strata] restart requested: conversations {saved}; the server ends and starts again", flush=True)
+            self._json(200, {"status": "restarting", "saved": saved})
+            svc.restart_requested.set()
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -5730,6 +7323,9 @@ def make_handler(svc: Service):
             in (["*"]: every page) could name any file and, CORS allowing, read what the model says about it.  data:
             and http(s) images are the page's own to send; files come from Strata's own page, a trusted origin or a
             client that is no browser.  ValueError (a 400)."""
+            if self.key_scope == "model" and any(not src.startswith("data:") for src in images_of(messages)):
+                # local: a model-only key sends its images itself - the server reads no file and fetches no URL for it
+                raise ValueError("this key may send images as data: URLs only")
             if self._foreign_origin() and any(not src.startswith(("data:", "http://", "https://"))
                                               for src in images_of(messages)):
                 raise ValueError("a web page of another origin cannot have a file on this computer read as an "
@@ -5756,7 +7352,43 @@ def make_handler(svc: Service):
                   if shared else "[strata] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
+        def _convert(self):
+            # a document attached in the web app -> its text ({"name", "data": base64 or a data: URL} -> {"text"});
+            # only the app's own page may ask, like /settings (it reads what it is sent, nothing on disk)
+            try:
+                size = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                self._json(400, {"error": {"message": "invalid Content-Length"}})
+                return
+            if size > MAX_CONVERT_BYTES * 4 // 3 + 65536:
+                self._json(413, {"error": {"message": f"the file is over {MAX_CONVERT_BYTES >> 20} MB"}})
+                return
+            body = self.rfile.read(size)
+            if not self._own_page("documents can be read"):
+                return
+            try:
+                req = json.loads(body or b"{}")
+                name = str(req.get("name") or "") if isinstance(req, dict) else ""
+                data = base64.b64decode(str(req.get("data") or "").split(",", 1)[-1], validate=True)
+                t0 = time.time()
+                text = convert_document(name, data)
+            except ValueError as e:                          # bad JSON / base64, or a type it does not convert
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            except RuntimeError as e:                        # MarkItDown is not installed
+                self._json(501, {"error": {"type": "server_error", "message": str(e)}})
+                return
+            except Exception as e:                           # a damaged or protected file: MarkItDown's own error
+                self._json(422, {"error": {"type": "invalid_request_error",
+                                           "message": f"could not read it ({type(e).__name__}: {e})"[:500]}})
+                return
+            print(f"[strata] document converted: {len(data):,} bytes -> {len(text):,} characters in "
+                  f"{time.time() - t0:.1f} s", flush=True)
+            self._json(200, {"name": name, "text": text, "chars": len(text)})
+
         def _sse(self):
+            if getattr(self, "sse_started", False):          # local: _wait_for_hold sent the headers already
+                return
             self._note(http_status=200)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -5764,6 +7396,91 @@ def make_handler(svc: Service):
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
             self._cors()
             self.end_headers()
+
+        def _chat_route(self, path, req):
+            if path == "/v1/responses":
+                self._responses(req)
+            elif path == "/v1/chat/completions":
+                self._openai(req)
+            else:
+                self._anthropic(req)
+
+        def _wait_for_hold(self, stream: bool, api: str = "openai") -> str:
+            """Local: a job holds the model suspended (strata_suspend.py run).  Refused with 503, an agent retries a
+            few times and then ends its turn with an error (opencode: about 9 tries), and nothing tells it when the
+            job is done.  So a request waits instead: a stream starts at once and gets a keep-alive every
+            KEEPALIVE_S (an idle timeout counts silence, not the wait) until the last holder ends, then the model is
+            loaded and the request goes on as usual.  A request that is not streamed waits silently.
+            -> "" (no hold, or it waited without a stream: the caller loads as usual), "started" (the stream is
+            started and the model loaded) or "answered" (the client left, or the load failed - said in the stream)."""
+            self.sse_started = False
+            if svc.loaded() or not svc.lease_holds():
+                return ""
+            print("[strata] a request waits for the job that holds the model (a lease)", flush=True)
+            with svc.status_lock:
+                svc.status["held_waiting"] = svc.status.get("held_waiting", 0) + 1
+            svc.agent_state(getattr(self, "agent_sid", None), "waiting out a hold")
+            try:
+                if not stream:
+                    while svc.lease_holds() and not svc.loaded():
+                        time.sleep(1.0)
+                    svc.lease_pass_quietly()                            # the leases ended: resume as the watcher does
+                    return ""
+                self._sse()
+                self.sse_started = True
+
+                def stream_error(e):
+                    err = {"type": "server_error", "message": f"the model could not come back after the job: {e}"}
+                    if api == "anthropic":
+                        self.wfile.write(b"event: error\ndata: " + json.dumps({"type": "error", "error": err}).encode()
+                                         + b"\n\n")
+                    else:
+                        self.wfile.write(b"data: " + json.dumps({"error": err}).encode() + b"\n\ndata: [DONE]\n\n")
+                    self.wfile.flush()
+                    return "answered"
+
+                while True:
+                    last = 0.0
+                    while svc.lease_holds() and not svc.loaded():
+                        if time.monotonic() - last >= KEEPALIVE_S:
+                            self.wfile.write(b": keep-alive (Strata is held for a running job; this request waits)\n\n")
+                            self.wfile.flush()
+                            last = time.monotonic()
+                        time.sleep(1.0)
+                    try:
+                        svc.lease_pass_quietly()                            # the leases ended: resume as the watcher does
+                        svc.load()
+                        break
+                    except GpuBusy as e:
+                        if svc.loaded() or not svc.lease_holds():
+                            return stream_error(e)
+                        # local: a second lease started right after the first ended, while this stream waited:
+                        # wait it out too, keep-alives and all, instead of ending the stream with an error
+                    except (EngineStarting, EngineStuck, EngineDied, RuntimeError) as e:
+                        return stream_error(e)
+                return "started"
+            except OSError:                                  # the client left while it waited
+                self._note(outcome="disconnected")
+                return "answered"
+            finally:
+                with svc.status_lock:
+                    svc.status["held_waiting"] = max(0, svc.status.get("held_waiting", 1) - 1)
+                svc.agent_state(getattr(self, "agent_sid", None), "generating")
+
+        def _load_or_wait(self, stream: bool, api: str = "openai") -> str:
+            """local: svc.load() for a request that passed _wait_for_hold while the model was still loaded, but a
+            lease (or hold) stopped it under the request before this load: wait it out the same way instead of
+            answering 503.  -> "" (loaded), "started" or "answered" (as _wait_for_hold)."""
+            while True:
+                try:
+                    svc.load()
+                    return ""
+                except GpuBusy:
+                    if svc.loaded() or not svc.lease_holds():
+                        raise
+                    w = self._wait_for_hold(stream, api)
+                    if w:
+                        return w
 
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
@@ -5815,7 +7532,13 @@ def make_handler(svc: Service):
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
-            svc.load()
+            waited = self._wait_for_hold(req.get("stream") is True)   # local: a job holds the model - wait for it
+            if waited == "answered":
+                return
+            if not waited:
+                waited = self._load_or_wait(req.get("stream") is True)   # a lease may have stopped it under us
+                if waited == "answered":
+                    return
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
@@ -5825,6 +7548,8 @@ def make_handler(svc: Service):
                     return
                 svc.mcp.wait(10)                                  # servers still starting (only right after start)
                 extra = svc.mcp.template_tools(exclude=own)       # the request's own tools win a name clash
+                if extra and svc.mcp.settings.get("subagents") and SUBAGENT_TOOL["name"] not in own:
+                    extra.append(SUBAGENT_TOOL)                   # mcp.subagents: helpers with a fresh context
                 use_mcp = bool(extra)
                 tools = (tools or []) + extra or None
             if force and use_mcp:
@@ -5833,11 +7558,16 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
-            self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
+            run_id = req.get("strata_run")                   # local: a run that outlives the page (detached runs)
+            if not (isinstance(run_id, str) and RUN_ID.fullmatch(run_id) and req.get("stream") is True and use_mcp):
+                run_id = None
+            # #430 #431 (#1999: before prepare, which can take long); a detached run is not stopped by a hang-up
+            self._watch_client(threading.Event() if run_id else cancel)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
+            detached = DetachedRun(cancel) if run_id else None
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
-                               {t["name"] for t in extra}) if use_mcp else None
+                               {t["name"] for t in extra}, inbox=detached) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
@@ -5845,6 +7575,9 @@ def make_handler(svc: Service):
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
+            if detached is not None:
+                run_register(svc, run_id, detached)
+                self.wfile = RunTee(self.wfile, detached, lambda: self._note(outcome="page left; still running"))
             try:
                 for c in chunks:
                     if c is None:
@@ -5869,6 +7602,91 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            finally:
+                if detached is not None:
+                    detached.finish()
+                    self.wfile = self.wfile.wfile or io.BytesIO()   # the page left: nothing more goes to it
+
+        def _run_helper(self, req):
+            """POST /v1/subagent {"task", "label"?, "continue"?, "reasoning_effort"?}: one helper, run as the model's
+            subagent call would run it, streamed as the chat's strata_mcp events (progress, then one result).  The
+            page puts the result into the helper block it was asked for - a call that was not run, or one to run
+            again - so the model does not have to write the task out a second time."""
+            if svc.mcp is None or not svc.mcp.settings.get("subagents"):
+                self._json(404, {"error": {"message": "helpers are off (mcp.subagents)"}})
+                return
+            if not isinstance(req.get("task"), str) or not req["task"].strip():
+                raise ValueError('send {"task": "..."}')
+            waited = self._wait_for_hold(True)
+            if waited == "answered":
+                return
+            if not waited:
+                waited = self._load_or_wait(True)                        # a lease may have stopped it under us
+                if waited == "answered":
+                    return
+            svc.mcp.wait(10)
+            extra = svc.mcp.template_tools() + [SUBAGENT_TOOL]
+            _, _, kw = openai_to_messages({"messages": [{"role": "user", "content": "x"}],
+                                           **({"reasoning_effort": req["reasoning_effort"]}
+                                              if isinstance(req.get("reasoning_effort"), str) else {})})
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            call = types.SimpleNamespace(id="run-" + uuid.uuid4().hex[:12], name=SUBAGENT_TOOL["name"],
+                                         arguments={k: req[k] for k in ("task", "label", "continue") if k in req})
+            self._sse()
+
+            def send(event):
+                self.wfile.write(b"data: " + json.dumps({"strata_mcp": event}, ensure_ascii=False).encode() + b"\n\n")
+                self.wfile.flush()
+            try:
+                gen = run_subagent(svc, svc.mcp, call, extra, kw, 0, req, cancel, {t["name"] for t in extra})
+                while True:
+                    try:
+                        kind, x = next(gen)
+                    except StopIteration as stop:
+                        r = stop.value
+                        break
+                    if kind == "ping":
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                    elif kind == "mcp":
+                        send({**x, "id": "helper"})
+                if r is not None:
+                    print(f"[strata] subagent (run from the page): {'ok' if r['ok'] else 'error'}, {r['chars']:,} "
+                          f"characters in {r['ms'] / 1000:.1f} s", flush=True)
+                    send({"event": "result", "id": "helper", **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}})
+                self.wfile.write(b"data: [DONE]\n\n")
+            except OSError:
+                cancel.set()
+            except (EngineDied, ValueError) as e:
+                try:
+                    self.wfile.write(b"data: " + json.dumps({"error": {"message": str(e)}}).encode() + b"\n\ndata: [DONE]\n\n")
+                except OSError:
+                    pass
+
+        def _run_attach(self, run_id: str):
+            """GET /v1/runs/<id>: a detached run's stream from its start, then live until it ends."""
+            runs, lock = runs_of(svc)
+            with lock:
+                run = runs.get(run_id)
+            if run is None:
+                self._json(404, {"error": {"message": "no such run (it ended over an hour ago, or the server restarted)"}})
+                return
+            self._sse()
+            i = 0
+            try:
+                while True:
+                    with run.cond:
+                        if i >= len(run.parts) and not run.done:
+                            run.cond.wait(5.0)
+                        parts, done = run.parts[i:], run.done
+                    i += len(parts)
+                    self.wfile.write(b"".join(parts) if parts else b"" if done else b": keep-alive\n\n")
+                    self.wfile.flush()
+                    if done and i >= len(run.parts):
+                        return
+            except OSError:
+                return
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
@@ -5905,7 +7723,9 @@ def make_handler(svc: Service):
             except ModelBusy as e:
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
-                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                ra = getattr(e, "retry_after", None)
+                return self._json(503, responses_error_body(str(e), "server_error", code="server_error"),
+                                  headers={"Retry-After": int(ra)} if ra else None)
 
             def check(text, finish):
                 return validated_json(text, validator, finish)
@@ -6010,7 +7830,13 @@ def make_handler(svc: Service):
                 check_request_sampling(req)                   # the request is also the sampling dict (see below)
             except ValueError as e:                           # its message starts with the field's name: the param
                 raise ResponsesError(str(e), str(e).partition(":")[0]) from None
-            svc.load()
+            waited = self._wait_for_hold(req.get("stream") is True)   # local: a job holds the model - wait for it
+            if waited == "answered":
+                return
+            if not waited:
+                waited = self._load_or_wait(req.get("stream") is True)   # a lease may have stopped it under us
+                if waited == "answered":
+                    return
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
@@ -6048,7 +7874,13 @@ def make_handler(svc: Service):
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
-            svc.load()
+            waited = self._wait_for_hold(req.get("stream") is True, "anthropic")   # local: a job holds the model
+            if waited == "answered":
+                return
+            if not waited:
+                waited = self._load_or_wait(req.get("stream") is True, "anthropic")   # a lease may have stopped it
+                if waited == "answered":
+                    return
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
@@ -6302,6 +8134,50 @@ def key_list(value) -> list[str]:
     if isinstance(value, (list, tuple)):
         return [str(k) for k in value if str(k)]
     return [k.strip() for k in str(value).split(",") if k.strip()]
+
+
+def api_keys_from_file(path) -> tuple[list[str], list[str]]:
+    """local: the config's "api_key_file" - JSON {"full": [keys], "model": [keys]}, kept where only the server's account
+    and its owner can read it (the run config itself may be readable by others).  A "model" key may use the model and
+    nothing else (Handler._model_key_allows).  ValueError for a malformed file or an empty key."""
+    data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    if not isinstance(data, dict) or not set(data) <= {"full", "model"}:
+        raise ValueError('expected {"full": [...], "model": [...]}')
+    out = []
+    for kind in ("full", "model"):
+        keys = data.get(kind) or []
+        if not isinstance(keys, list) or not all(isinstance(k, str) and k.strip() for k in keys):
+            raise ValueError(f'"{kind}": a list of non-empty keys')
+        out.append([k.strip() for k in keys])
+    if set(out[0]) & set(out[1]):
+        raise ValueError("a key is listed as both full and model")
+    return out[0], out[1]
+
+
+# local: what a model-only key may do - the model itself and the suspend wrapper's own hold, nothing else (no
+# server-side tools, files, chats, runs, monitor, settings, or loading the model over other jobs)
+MODEL_KEY_GET = frozenset({"/health", "/api/health", "/v1/models", "/models", "/leases"})
+MODEL_KEY_POST = frozenset({"/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/messages/count_tokens",
+                            "/lease"})
+RESTART_EXIT_CODE = 75                                  # local: POST /restart; tools/strata_service.py restarts on it
+MODEL_KEY_DROPPED = ("strata_mcp", "strata_run")      # request fields that would run server-side tools
+
+
+def model_key_control_ok(path: str, control: dict) -> bool:
+    """local: a model-only key's control body: only the suspend wrapper's own lease (tools/strata_suspend.py run) -
+    create it, renew it, end it, or mark its session woken; never stop a lease, load or unload the model."""
+    keys = set(control)
+    if path == "/unload":
+        return False
+    if path == "/lease":
+        return "mode" in control and keys <= {"cmd", "cwd", "mode", "session", "log"}
+    if path == "/lease/session-woken":
+        return keys == {"agent", "id"}
+    if path == "/lease/stop" or path.endswith("/stop"):
+        return False                                     # stopping is the user's, not a job's own key
+    if path.startswith("/lease/"):
+        return keys <= ({"exit"} if path.endswith("/end") else set())
+    return False
 
 
 def api_key_of(value):
@@ -6620,6 +8496,82 @@ def default_model_name(cfg: dict) -> str:
     return cfg.get("model_name") or FAMILY_MODEL_NAMES.get(cfg.get("arch") or "qwen4exp", "qwen3.8-flash-next")
 
 
+def spawn_job_wake(after_s: float = 15.0, popen=subprocess.Popen, log: Path | None = None):
+    """Local "wake_cut_off_jobs": a few seconds after the start (the hold watcher has settled the old holds by then),
+    `tools/strata_suspend.py wake` tells the sessions the lease checkpoint names - an expired lease's session and,
+    after an unclean shutdown, the sessions that had a request in Strata when it went down (see tools/strata_jobs.py).
+    In the background: the start does not wait for it; its output goes to data/strata-wake.log (`log`: elsewhere -
+    the tests)."""
+    log = log or ROOT / "data" / "strata-wake.log"
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+        flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
+        with open(log, "a", encoding="utf-8") as out:
+            out.write(f"\n# {time.strftime('%Y-%m-%d %H:%M:%S')} Strata started: wake in {after_s:.0f} s\n")
+            out.flush()
+            popen([sys.executable, str(ROOT / "tools" / "strata_suspend.py"), "wake", "--after", str(after_s)],
+                  stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=str(ROOT), creationflags=flags,
+                  start_new_session=os.name != "nt", close_fds=True)
+        print(f"[strata] wake_cut_off_jobs: sessions whose wrapped jobs were cut off are told in {after_s:.0f} s "
+              f"(log: {log})", flush=True)
+    except OSError as e:
+        print(f"[strata] wake_cut_off_jobs: could not start ({e})", flush=True)
+
+
+def hibernated_at_start(hibernate_dir, cwd=None) -> bool:
+    """Hibernated when the server stopped (the folder's hibernate.txt is there): start unloaded, so the GPU stays with
+    whatever it was given to until POST /load resumes (or /load {"fresh": true} discards).  A relative folder is the
+    config's cwd's, as hibernate_dir is everywhere else."""
+    if not isinstance(hibernate_dir, str) or not hibernate_dir:
+        return False
+    d = Path(hibernate_dir)
+    if not d.is_absolute() and cwd:
+        d = Path(cwd) / d
+    if not (d / "hibernate.txt").exists():
+        return False
+    print(f"[strata] hibernate: {d} holds saved conversations - the model stays unloaded until POST /load resumes "
+          "them (or /load {\"fresh\": true} discards them)", flush=True)
+    return True
+
+
+class _Tee:
+    """local: what the server prints goes to its window and, with a timestamp per line, to a file - so the reason a
+    server stopped outlives its closed window."""
+
+    def __init__(self, stream, log):
+        self.stream, self.log, self.at_start = stream, log, True
+
+    def write(self, text):
+        n = self.stream.write(text)
+        try:
+            for part in text.splitlines(keepends=True):
+                if self.at_start:
+                    self.log.write(time.strftime("%m-%d %H:%M:%S "))
+                self.log.write(part)
+                self.at_start = part.endswith("\n")
+            self.log.flush()
+        except (OSError, ValueError):
+            pass
+        return n
+
+    def flush(self):
+        self.stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def tee_console(path: str):
+    """config "console_log": a copy of the console, appended (a new start is marked)."""
+    try:
+        log = open(path, "a", encoding="utf-8", errors="replace")
+    except OSError as e:
+        print(f"[strata] console_log {path}: {e}", file=sys.stderr, flush=True)
+        return
+    log.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} server start (pid {os.getpid()}) =====\n")
+    sys.stdout, sys.stderr = _Tee(sys.stdout, log), _Tee(sys.stderr, log)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -6659,6 +8611,9 @@ def main() -> int:
                          "\"min_free_vram_mib\" in the config; default: always load)")
     ap.add_argument("--before-load", help="a command run before the model is loaded again (e.g. to unload another "
                                           "server's model; also \"before_load\" in the config, a string or a list)")
+    ap.add_argument("--hibernate-dir", help="the folder POST /unload {\"save\": true} writes the parked conversations "
+                                            "to and POST /load reads back (also \"hibernate_dir\" in the config; "
+                                            "default: off)")
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
@@ -6668,6 +8623,8 @@ def main() -> int:
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    if cfg.get("console_log"):
+        tee_console(cfg["console_log"])
     lift_reasoning_effort_arg(cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas
@@ -6704,6 +8661,8 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
+        if not lazy and hibernated_at_start(a.hibernate_dir or cfg.get("hibernate_dir"), cfg.get("cwd")):
+            lazy = True
         if cfg.get("vision"):
             elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
@@ -6747,6 +8706,12 @@ def main() -> int:
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
             raise SystemExit(f"[strata] config {e}")
+        save_on_close = os.name == "nt" and cfg.get("save_on_close") is True and not groups
+        if save_on_close and disk_persist_mode(engine_args(cfg)) == "off":
+            print("[strata] \"save_on_close\" needs --conversation-disk-persist (and --conversation-disk-dir) in the "
+                  "config's args: closing the window would end the engine without saving; off", flush=True)
+            save_on_close = False
+        StrataEngine.detach_console = save_on_close    # before the first start (serve/winclose.py)
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
         else:
@@ -6815,6 +8780,15 @@ def main() -> int:
     except ValueError as e:
         print(f'[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / "api_key" out', file=sys.stderr)
         return 2
+    if cfg.get("api_key_file"):                          # local: keys kept out of the (readable) run config
+        try:
+            full, model = api_keys_from_file(cfg["api_key_file"])
+        except (OSError, ValueError) as e:
+            print(f"[strata] api_key_file {cfg['api_key_file']}: {e}", file=sys.stderr)
+            return 2
+        svc.api_key = key_list(svc.api_key) + full + model
+        svc.model_keys = model
+        print(f"[strata] API keys from {cfg['api_key_file']}: {len(full)} full, {len(model)} model-only", flush=True)
     if not svc.api_key and "api_key" in cfg:             # #569: written, but empty: the server has none (a warning, not a stop)
         print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
@@ -6837,6 +8811,7 @@ def main() -> int:
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
+    svc.idle_release_s = float(cfg.get("idle_release_s") or 0)   # local: needs "hibernate_dir"
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
@@ -6847,6 +8822,12 @@ def main() -> int:
               f"{svc.before_load_timeout_s:g} s", flush=True)
     svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
     svc.before_load_strict = cfg.get("before_load_strict") is True
+    svc.resume_on_request = cfg.get("resume_on_request") is True
+    svc.memory_check_on_load = cfg.get("memory_check_on_load") is True
+    for key, cast in (("resume_margin_mib", int), ("resume_wait_s", float)):
+        v = cfg.get(key)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+            setattr(svc, key, cast(v))
     # --slot-save-path is relative to the working directory the server was started in; the config's slot_save_path
     # to the config's "cwd" (the engine's folder) when it has one.  Either way the engine gets an absolute path.
     if a.slot_save_path or cfg.get("slot_save_path"):
@@ -6857,6 +8838,39 @@ def main() -> int:
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    if cfg.get("chat_dir"):                              # local: the web chat shared by every device (serve/chat_store.py)
+        from serve.chat_store import ChatStore
+        try:
+            svc.chat_store = ChatStore(slot_save_dir(cfg["chat_dir"], cfg.get("cwd")))
+        except (ValueError, OSError) as e:
+            raise SystemExit(f"[strata] chat_dir: {e}")
+        print(f"[strata] chat: kept in {svc.chat_store.dir} - every device's page shows the same chat", flush=True)
+    hib = a.hibernate_dir or cfg.get("hibernate_dir")
+    if hib:
+        try:
+            svc.hibernate_dir = slot_save_dir(hib) if a.hibernate_dir else slot_save_dir(hib, cfg.get("cwd"))
+        except (ValueError, OSError) as e:
+            raise SystemExit(f"[strata] hibernate_dir: {e}")
+        print(f'[strata] hibernate: POST /unload {{"save": true}} saves the conversations to {svc.hibernate_dir} and '
+              "latches the model unloaded; POST /load resumes it", flush=True)
+        args_now = engine_args(cfg)
+        if disk_persist_mode(args_now) != "off" and "--conversation-disk-dir" in args_now:
+            svc.disk_persist = True                     # local: a full hibernate goes through the disk tier
+            print("[strata] hibernate: through the persistent disk tier (only what is not on the disk yet is written; "
+                  "a resume restores each conversation when a request continues it)", flush=True)
+    if cfg.get("leases_dir"):                           # local: the lease table (serve/leases.py); default is
+        svc.leases_dir = str(cfg["leases_dir"])         # <hibernate_dir>/leases
+    if cfg.get("lease_expire_s") is not None:
+        try:
+            svc.lease_expire_s = float(cfg["lease_expire_s"])
+        except (TypeError, ValueError):
+            raise SystemExit("[strata] config \"lease_expire_s\" must be a number of seconds")
+    if svc._leases_folder() is not None:                # local: open the lease table now, so a save checkpoints and
+        try:                                            # a live lease holds from the first request on
+            svc.lease_table()
+        except Exception as e:  # noqa: BLE001 - the lease table is a help: the pid holds still work without it
+            print(f"[strata] lease: the table could not be opened ({e}); leases are not kept until it can be",
+                  flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -6916,8 +8930,16 @@ def main() -> int:
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
+    if svc.idle_release_s and not svc.hibernate_dir:
+        print("[strata] \"idle_release_s\" needs \"hibernate_dir\" in the config: off", flush=True)
+        svc.idle_release_s = 0
     svc.start_idle_unload()
     svc.start_vision_idle()
+    if svc.hibernate_dir:
+        svc.start_hold_watch()                          # local: resume when the last holding job has ended
+    if cfg.get("wake_cut_off_jobs") is True:            # local: tell the sessions whose wrapped jobs were cut off
+        svc.start_lease_beat()                          # the lease checkpoint: who was working, kept every minute
+        spawn_job_wake()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
@@ -6950,13 +8972,45 @@ def main() -> int:
         signal.signal(signal.SIGTERM, on_sigterm)
     except (ValueError, OSError, AttributeError):         # not the main thread
         pass
+    if StrataEngine.detach_console:
+        # local "save_on_close": the window's X, log-off or shutdown give this process ~5 s.  Let the engine outlive
+        # it and close its stdin: the engine, which has no console of its own, treats that as QUIT, writes the current
+        # and the parked conversations to the disk (--conversation-disk-persist) and ends on its own.
+        from serve import winclose, winjob
+
+        def on_close():
+            print("[strata] window closing: the engine writes its conversations to the disk and then ends", flush=True)
+            try:                                         # local: who was working, to the second (Windows ends it soon)
+                svc.lease_beat(shutting_down=True)
+            except Exception:  # noqa: BLE001 - the save below matters more
+                pass
+            winjob.release()
+            proc = getattr(engine, "proc", None)
+            if proc is not None and proc.stdin:
+                try:
+                    proc.stdin.close()
+                except (OSError, ValueError):
+                    pass
+
+        if winclose.install(on_close):
+            print("[strata] save_on_close: closing this window or Ctrl+C saves the conversations first "
+                  "(Ctrl+C twice ends at once, without saving)", flush=True)
+    restarting = False
     try:
         while True:
             time.sleep(1)                               # Windows never delivers Ctrl+C to an untimed Event.wait()
+            if svc.restart_requested.is_set():          # local: POST /restart - the same way out as Ctrl+C
+                restarting = True
+                raise KeyboardInterrupt
     except KeyboardInterrupt:
-        print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
-        closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
-                   hub.close if hub is not None else None]
+        print("\n[strata] restarting ..." if restarting else
+              "\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+        try:                                         # local: a clean end: the waker must not wake every session that
+            svc.lease_beat(shutting_down=True)       # was working (the checkpoint's register is not a cut-off list)
+        except Exception:  # noqa: BLE001 - the shutdown matters more
+            pass
+        closers = [httpd.shutdown, svc.close_leases, getattr(engine, "close", None),
+                   vision.shutdown if vision else None, hub.close if hub is not None else None]
         for close in filter(None, closers):
             try:
                 close()
@@ -6969,7 +9023,7 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001 - never block the exit
             print(f"[strata] could not release the model files' cache: {e}", flush=True)
         print("[strata] stopped", flush=True)
-    return 0
+    return RESTART_EXIT_CODE if restarting else 0
 
 
 if __name__ == "__main__":

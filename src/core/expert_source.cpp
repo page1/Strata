@@ -4471,7 +4471,17 @@ ArenaExpertSource::~ArenaExpertSource() { close(); }
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
                              std::string& err, uint64_t max_pinned_bytes,
                              const std::string& shared_arena_file) {
-    close();
+    {   // close() drops an early load: keep the one this open is about to take (STRATA_EARLY_ARENA)
+        void* ea = early_arena_;
+        std::thread et = std::move(early_thread_);
+        std::shared_ptr<LoadStats> es = early_stats_;
+        early_arena_ = nullptr;
+        early_stats_.reset();
+        close();
+        early_arena_ = ea;
+        early_thread_ = std::move(et);
+        early_stats_ = es;
+    }
     const std::string path = pack_dir + "/experts.bin";
     // plan v0.3 P6: the layout (canonical, or a native pack's per-layer blobs) was loaded by the driver
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
@@ -4484,6 +4494,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 
     // plan v0.3 P6: no experts.bin in a native pack -> the experts come straight from the GGUF
     const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
+    path_ = path;                    // what a partial hibernate's reacquire_memory reads again
+    from_gguf_ = from_gguf;
+    load_threads_ = threads;
+    released_ = false;
     // SIZE CHECK BEFORE THE ALLOCATION, not after.  A wrong pack should name the two numbers rather than spend
     // 34 GB and a minute of loading first.
     if (from_gguf) {
@@ -4555,7 +4569,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // engine still exiting) is only a warning - the OS may make room - per the recommend-not-force rule.
     ram_warning_.clear();
     // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked)
-    if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm)) {
+    if (detail::HostMemory hm; early_arena_ == nullptr && shared_arena_file.empty() &&
+                               detail::host_available_memory(hm)) {
         const uint64_t need = want + (uint64_t) blob;
         const double gib = 1073741824.0;
         char buf[512];
@@ -4655,11 +4670,18 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 #else
     const bool deferred = false;
 #endif
-    PinnedArena* a = by_need ? new PinnedArena(arena_bytes + (uint64_t) blob, PinnedArena::ByNeed{}, need_ranges,
+    const bool early = early_arena_ != nullptr && !deferred && !by_need && !padded_ &&
+                       shared_arena_file.empty() &&
+                       ((PinnedArena*) early_arena_)->capacity == want + (uint64_t) blob;
+    if (early_arena_ != nullptr && !early) discard_early();   // not usable here: load as before
+    if (early && early_thread_.joinable()) early_thread_.join();
+    PinnedArena* a = early ? (PinnedArena*) early_arena_
+                   : by_need ? new PinnedArena(arena_bytes + (uint64_t) blob, PinnedArena::ByNeed{}, need_ranges,
                                                max_pinned_bytes, shared_arena_file, pack_hash)
                    : deferred ? new PinnedArena(want + (uint64_t) blob, bounds, PinnedArena::Deferred{})
                               : new PinnedArena(want + (uint64_t) blob, bounds, max_pinned_bytes,
                                                 shared_arena_file, pack_hash);
+    early_arena_ = nullptr;
     if (!a->valid()) {
         const std::string why = a->note;
         delete a;
@@ -4680,10 +4702,16 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     } else {
         files.push_back(path);
     }
-    std::string why;
-    const bool unbuffered = experts_unbuffered(files, want + (uint64_t) blob, why);
+    std::string why = early ? early_why_ : std::string{};
+    const bool unbuffered = early ? early_unbuffered_ : experts_unbuffered(files, want + (uint64_t) blob, why);
     const int readers = unbuffered ? std::max(threads, 16) : threads;   // 16 keep a PCIe 5 drive's queue full
     LoadStats st;
+    if (early) {
+        st = *early_stats_;
+        early_stats_.reset();
+        // the early thread registered the arena before it read into it (begin_early_load)
+        a->note = "read early, on its own threads (STRATA_EARLY_ARENA); " + a->note;
+    }
     std::atomic<int> ready{0};
     std::thread reg;
     if (deferred) {
@@ -4695,7 +4723,9 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         });
     }
     const std::atomic<int>* rp = deferred ? &ready : nullptr;
-    if (from_gguf) {
+    if (early) {
+        // loaded above, by the early thread
+    } else if (from_gguf) {
         st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, rp, padded_ ? &pad_ : nullptr);
     } else {
         if (unbuffered && !padded_) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
@@ -4800,7 +4830,161 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     return true;
 }
 
+bool ArenaExpertSource::release_memory(std::string& err) {
+    auto* a = (PinnedArena*) arena_;
+    if (a == nullptr || map_ != nullptr) {
+        err = "there is no pinned RAM arena to give back (--mmap-experts or STRATA_ARENA_MMAP)";
+        return false;
+    }
+    if (released_) return true;
+    if (!a->release_pages(err)) return false;
+    dev_slice_.clear();
+    pinned_bytes_ = 0;
+    released_ = true;
+    return true;
+}
+
+bool ArenaExpertSource::reacquire_memory(std::string& err) {
+    if (!released_) return true;
+    auto* a = (PinnedArena*) arena_;
+    if (a == nullptr || !a->reacquire_pages(err)) return false;
+    pinned_bytes_ = a->registered_bytes;
+    dev_slice_.clear();
+    void* d = nullptr;
+    if (cudaHostGetDevicePointer(&d, (void*) base_, 0) == cudaSuccess && d != nullptr) {
+        dev_slice_.push_back((const uint8_t*) d);
+    } else {
+        (void) cudaGetLastError();
+    }
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    std::vector<std::string> files;
+    if (from_gguf_) {
+        for (int64_t l = 0; l < lay.n_layers; ++l)
+            for (int r = 0; r < 3; ++r) {
+                const std::string f = expert_gguf_file(gguf_, lay, l, r);
+                if (std::find(files.begin(), files.end(), f) == files.end()) files.push_back(f);
+            }
+    } else {
+        files.push_back(path_);
+    }
+    std::string why;
+    const bool unbuffered = experts_unbuffered(files, a->capacity, why);
+    const int readers = unbuffered ? std::max(load_threads_, 16) : load_threads_;
+    LoadStats st;
+    if (from_gguf_) {
+        st = load_experts_gguf(gguf_, a->data(), lay, readers, unbuffered, nullptr);
+    } else {
+        std::vector<uint64_t> loff, lbytes;
+        for (int64_t l = 0; l < lay.n_layers; ++l) {
+            loff.push_back(lay.layer_offset(l));
+            lbytes.push_back(lay.blob_bytes(l) * (uint64_t) lay.n_expert);
+        }
+        if (unbuffered) st = load_experts_direct(path_, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, nullptr);
+        if (!unbuffered || (!st.ok && st.error.empty()))
+            st = load_experts_ranges(path_, a->data(), loff, lbytes, load_threads_, /*chunk=*/8u << 20, nullptr);
+    }
+    if (!st.ok || st.bytes != lay.total) {
+        err = "the experts could not be read again: " + (st.error.empty() ? std::string("a short read") : st.error);
+        return false;
+    }
+    gib_per_s_ = st.gib_per_second();
+    load_seconds_ = st.seconds;
+    released_ = false;
+    return true;
+}
+
+void ArenaExpertSource::discard_early() {
+    if (early_thread_.joinable()) early_thread_.join();
+    delete (PinnedArena*) early_arena_;
+    early_arena_ = nullptr;
+    early_stats_.reset();
+}
+
+bool ArenaExpertSource::begin_early_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
+                                         std::string& note, uint64_t headroom_bytes) {
+#if !defined(_WIN32)
+    (void) pack_dir; (void) n_layers; (void) n_expert; (void) threads;
+    note = "Windows only";
+    return false;
+#else
+    if (arena_ != nullptr || early_arena_ != nullptr) { note = "an arena is already open"; return false; }
+    const std::string path = pack_dir + "/experts.bin";
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    if (lay.n_layers != n_layers || lay.n_expert != n_expert) { note = "the layout is for another geometry"; return false; }
+    const int64_t blob = (int64_t) lay.max_blob;
+    const uint64_t want = lay.total;
+    const bool from_gguf = !std::ifstream(path, std::ios::binary) && lay.native && !lay.gguf_off.empty() && !gguf_.empty();
+    std::string err;
+    if (from_gguf) {
+        if (!check_experts_gguf(gguf_, lay, err)) { note = err; return false; }   // open() says it again
+    } else {
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        const uint64_t got = f ? (uint64_t) f.tellg() : 0;
+        if (got != want && got != want + (uint64_t) blob) { note = "experts.bin does not match"; return false; }
+    }
+    if (detail::HostMemory hm; !detail::host_available_memory(hm) ||
+                               hm.available < want + (uint64_t) blob + headroom_bytes) {
+        // open() decides, with its warning: loaded as before
+        char buf[200];
+        std::snprintf(buf, sizeof buf, "%.1f GiB of RAM available, the arena needs %.1f GiB plus %.1f GiB for the rest "
+                      "of the start: loaded as before", hm.available / 1073741824.0,
+                      (want + (uint64_t) blob) / 1073741824.0, headroom_bytes / 1073741824.0);
+        note = buf;
+        return false;
+    }
+    std::vector<uint64_t> bounds, loff, lbytes;
+    for (int64_t l = 0; l < n_layers; ++l) {
+        bounds.push_back(lay.layer_offset(l));
+        loff.push_back(lay.layer_offset(l));
+        lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
+    }
+    bounds.push_back(want);
+    std::vector<std::string> files;
+    if (from_gguf) {
+        for (int64_t l = 0; l < n_layers; ++l)
+            for (int r = 0; r < 3; ++r) {
+                const std::string fl = expert_gguf_file(gguf_, lay, l, r);
+                if (std::find(files.begin(), files.end(), fl) == files.end()) files.push_back(fl);
+            }
+    } else {
+        files.push_back(path);
+    }
+    auto* a = new PinnedArena(want + (uint64_t) blob, bounds, PinnedArena::Unregistered{});
+    if (!a->valid()) { note = "the arena could not be reserved"; delete a; return false; }
+    std::string why;
+    const bool unbuffered = experts_unbuffered(files, want + (uint64_t) blob, why);
+    const int readers = unbuffered ? std::max(threads, 16) : threads;
+    early_arena_ = a;
+    early_unbuffered_ = unbuffered;
+    early_why_ = why;
+    early_stats_ = std::make_shared<LoadStats>();
+    auto stats = early_stats_;
+    const std::string gg = gguf_;
+    const strata::kernels::cpu::ExpertLayout* lp = &lay;
+    early_thread_ = std::thread([a, stats, gg, lp, from_gguf, path, loff, lbytes, readers, threads, unbuffered,
+                                 bounds] {
+        // touched and registered BEFORE the read, as the normal path does: an arena registered after it was
+        // filled cost ~1.5 s at the next large GPU step (measured: the cache's cudaMalloc, or its fill)
+        a->pretouch();
+        a->register_now(bounds, 0);   // the whole range (one GPU: the open() it replaces passes no cap either)
+        LoadStats st;
+        if (from_gguf) {
+            st = load_experts_gguf(gg, a->data(), *lp, readers, unbuffered, nullptr);
+        } else {
+            if (unbuffered) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, nullptr);
+            if (!unbuffered || (!st.ok && st.error.empty()))
+                st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, nullptr);
+        }
+        *stats = std::move(st);
+    });
+    note = std::string("started (") + (unbuffered ? "unbuffered" : "through the file cache") + ", " +
+           std::to_string(readers) + " readers)";
+    return true;
+#endif
+}
+
 void ArenaExpertSource::close() {
+    discard_early();
 #if !defined(_WIN32)
     if (map_ != nullptr) munmap(map_, (size_t) map_bytes_);
 #endif

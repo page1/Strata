@@ -933,7 +933,25 @@ public:
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's GGUF: `native` is the
     /// --native shard, and native_experts.txt names the other shards beside it (per layer, or per role in v4).
     void set_gguf(const std::string& native) { gguf_ = native; }
+    /// Local (STRATA_EARLY_ARENA=1, Windows): reserve the arena and start loading it NOW on a background thread:
+    /// touch, register (pinned, as open() would), then read the experts, so the read overlaps the dense weights, MTP
+    /// and head.  open() then waits for it.  Registering before the read matters: an arena registered after it was
+    /// filled cost ~1.5 s at the next large GPU step.  (#620 - WDDM refusing allocations after the registration -
+    /// did not show on one GPU here.)  False, with `note`, when it cannot (nothing started; open() loads as before).
+    /// It starts only when the available RAM covers the arena plus `headroom_bytes` (what the rest of the start
+    /// still allocates, and the floor kept free): pinned first, a short arena would make a LATER allocation fail
+    /// instead of open()'s plain warning.  Short of that it does nothing, and open() loads and warns as before.
+    bool begin_early_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
+                          std::string& note, uint64_t headroom_bytes);
     void close();
+
+    /// Partial hibernate: give the arena's RAM back (PinnedArena::release_pages: the experts are gone, the addresses
+    /// kept) and take it again - committed, pinned, the device aliases looked up again and the experts read again
+    /// as `open` read them.  Nothing may read a blob in between.  False with `err` when this arena cannot (an
+    /// arena that could not be taken again is unusable: the engine must end).
+    bool release_memory(std::string& err);
+    bool reacquire_memory(std::string& err);
+    bool released() const { return released_; }
 
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
@@ -1010,6 +1028,17 @@ private:
     /// index of the registered range holding [off, off + len), or -1
     int64_t pin_range_of(uint64_t off, uint64_t len) const;
     std::string gguf_;
+    std::string path_;               ///< experts.bin, when the experts were read from it (partial hibernate's re-read)
+    bool from_gguf_ = false;
+    int load_threads_ = 0;
+    bool released_ = false;
+    // STRATA_EARLY_ARENA: the arena being loaded by early_thread_, and what the load returns
+    void* early_arena_ = nullptr;
+    std::thread early_thread_;
+    std::shared_ptr<LoadStats> early_stats_;
+    bool early_unbuffered_ = false;
+    std::string early_why_;
+    void discard_early();
 };
 
 /// Plan v0.3 P6: checks native_experts.txt's GGUF spans against the files, before anything is read: each layer's

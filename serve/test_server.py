@@ -22,7 +22,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
-from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
+from serve.server import (CTX_SLACK, ByteTokenizer, EFFORT_TEXT, EFFORT_TURN, EngineDied, EngineNonFinite, GpuBusy,
+                          MockEngine,  # noqa: E402
                           PP_DONE_TAIL, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           prompt_tokens_seen,
@@ -827,6 +828,45 @@ class EffortAtTheEnd(unittest.TestCase):
         # without it the checkpoint held the effort turn and the next turn reused nothing (what #458 measured)
         self.assertEqual(self.session([(turn1, low), (turn2, low)], True, False), [0])
 
+    def test_an_earlier_effort_turn_is_rendered_back(self):
+        """#458 follow-up: an answer written at a non-default effort carries its effort (strata_effort), and the
+        history renders that effort turn exactly where the engine held it - so the next turn's prompt starts with
+        the whole previous prompt plus the answer, and nothing of the answer is read again."""
+        low = {"reasoning_effort": "low"}
+        t1 = self.tok.decode(self.ids(self.CHAT, True, **low))
+        self.assertTrue(t1.endswith(EFFORT_TURN.format(EFFORT_TEXT["low"]) + "<|im_start|>assistant\n<think>\n"), t1[-200:])
+        reply = dict(self.REPLY, strata_effort="low")
+        t2 = self.tok.decode(self.ids(self.CHAT + [reply, self.NEXT], True, **low))
+        self.assertTrue(t2.startswith(t1), f"turn 2 does not start with turn 1:\n...{t1[-160:]!r} / ...{t2[len(t1) - 160:len(t1) + 160]!r}")
+        # the answer follows the effort turn exactly as the engine generated it
+        self.assertIn(EFFORT_TURN.format(EFFORT_TEXT["low"]) + "<|im_start|>assistant\n<think>\nok\n</think>\n\n"
+                      + self.REPLY["content"].strip() + "<|im_end|>\n", t2)
+        # a message without strata_effort renders exactly as today: the effort turn is missing, and turn 2 does not
+        # start with turn 1 (the re-read this fixes)
+        plain = self.tok.decode(self.ids(self.CHAT + [self.REPLY, self.NEXT], True, **low))
+        self.assertFalse(plain.startswith(t1))
+        # effort_position "start" (effort_end off): strata_effort changes nothing, byte for byte
+        self.assertEqual(self.ids(self.CHAT + [reply, self.NEXT], False, **low),
+                         self.ids(self.CHAT + [self.REPLY, self.NEXT], False, **low))
+        self.assertEqual(self.ids(self.CHAT + [reply, self.NEXT], False, **low),
+                         self.tok.encode(self.svc.template.render(self.CHAT + [self.REPLY, self.NEXT], **low),
+                                         parse_special=True))
+
+    def test_a_switching_turn_keeps_the_earlier_effort_turns(self):
+        """high, low, low, high: the turn that switches may read its own effort turn, but everything before it -
+        including the earlier answers' effort turns - stays a prefix, so the answers are never read again."""
+        low, high = {"reasoning_effort": "low"}, {"reasoning_effort": "high"}
+        r_low = dict(self.REPLY, strata_effort="low")
+        r_high = dict(self.REPLY, strata_effort="high")
+        t1 = self.tok.decode(self.ids(self.CHAT, True, **high))
+        t2 = self.tok.decode(self.ids(self.CHAT + [r_high, self.NEXT], True, **low))
+        t3 = self.tok.decode(self.ids(self.CHAT + [r_high, self.NEXT, r_low, self.NEXT], True, **low))
+        t4 = self.tok.decode(self.ids(self.CHAT + [r_high, self.NEXT, r_low, self.NEXT, r_low, self.NEXT], True, **high))
+        self.assertTrue(t2.startswith(t1))
+        self.assertTrue(t3.startswith(t2))
+        self.assertTrue(t4.startswith(t3), f"the high turn lost the low effort turns:\n...{t3[-160:]!r} / ...{t4[len(t3) - 160:len(t3) + 160]!r}")
+        self.assertNotIn("<|im_start|>system\nReasoning effort is set to high", t4)   # high: no effort turn of its own
+
     def test_the_config(self):
         from serve.server import effort_end_args
 
@@ -985,6 +1025,67 @@ class ApiKeyForms(unittest.TestCase):
         finally:
             httpd.shutdown()
             httpd.server_close()
+
+
+def _has_markitdown() -> bool:
+    try:
+        import markitdown  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+class ConvertDocuments(unittest.TestCase):
+    """POST /convert: the web app's attach button turns a PDF / Office file into text (MarkItDown, optional)."""
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(svc, port=0)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/convert"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, name, data: bytes, origin=None):
+        import base64
+        headers = {"Content-Type": "application/json"}
+        if origin:
+            headers["Origin"] = origin
+        body = json.dumps({"name": name, "data": "data:application/pdf;base64," + base64.b64encode(data).decode()})
+        req = urllib.request.Request(self.url, body.encode(), headers)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_other_types_are_refused(self):
+        code, body = self.post("notes.exe", b"MZ")
+        self.assertEqual(code, 400)
+        self.assertIn(".pdf", body["error"]["message"])
+
+    def test_only_from_the_own_page(self):
+        code, _ = self.post("a.pdf", b"%PDF-1.4", origin="https://elsewhere.example")
+        self.assertEqual(code, 403)
+
+    @unittest.skipUnless(_has_markitdown(), "MarkItDown is not installed")
+    def test_pdf(self):
+        code, body = self.post("Strata-Paper.pdf", (ROOT / "docs/paper/Strata-Paper.pdf").read_bytes())
+        self.assertEqual(code, 200)
+        self.assertIn("Strata", body["text"])
+        self.assertGreater(body["chars"], 10000)
+
+    @unittest.skipUnless(_has_markitdown(), "MarkItDown is not installed")
+    def test_damaged_file(self):
+        code, body = self.post("broken.pdf", b"this is not a pdf")
+        self.assertIn(code, (200, 422))                 # pdfminer may also read it as an empty document
+        if code == 200:
+            self.assertLess(len(body["text"].strip()), 20)
+
+
 
 
 class ToolCallTerminators(unittest.TestCase):
@@ -3579,6 +3680,29 @@ class SharingTheGpu(unittest.TestCase):
         self.assertGreaterEqual(time.time() - t0, 0.9)
         self.assertFalse(self.engine.alive())
 
+    def test_restart_answers_then_asks_main_to_end(self):
+        """local: POST /restart - no hibernate folder here, so nothing is saved, and it says so."""
+        self.assertEqual(self.req("/restart", {}), (200, {"status": "restarting", "saved": "not saved (no hibernate_dir)"}))
+        self.assertTrue(self.svc.restart_requested.is_set())
+
+    def test_restart_only_as_json_from_its_own_page(self):
+        r = urllib.request.Request(self.base + "/restart", data=b"x=1", method="POST",
+                                   headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(r, timeout=30)
+        e.exception.close()
+        self.assertEqual(e.exception.code, 415)
+        self.assertFalse(self.svc.restart_requested.is_set())
+
+    def test_restart_refused_when_the_conversations_cannot_be_saved(self):
+        self.svc.hibernate_dir = Path(tempfile.mkdtemp())          # set, but this mock engine cannot hibernate
+        self.addCleanup(shutil.rmtree, self.svc.hibernate_dir, True)
+        s, b = self.req("/restart", {})
+        self.assertEqual(s, 503)
+        self.assertIn("could not be saved", b["error"]["message"])
+        self.assertFalse(self.svc.restart_requested.is_set())
+        self.assertTrue(self.engine.alive())
+
     def test_unload_wait_gives_up_after_the_given_seconds(self):
         with self.svc.fifo:
             t0 = time.time()
@@ -5619,3 +5743,168 @@ class PrepareCancelled(unittest.TestCase):
             ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
+
+
+class ModelOnlyKey(unittest.TestCase):
+    """local: "api_key_file" {"full": [...], "model": [...]} - a model-only key (for example a restricted account's) may use the model
+    and hold it for its own job, and nothing else: no server-side tools, files, chats, runs, monitor, settings, loading."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.svc.api_key = ["full-key", "model-key"]
+        cls.svc.model_keys = ["model-key"]
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def req(self, path, body=None, key="model-key", method=None):
+        h = {"Content-Type": "application/json"}
+        if key:
+            h["Authorization"] = "Bearer " + key
+        data = None if body is None else json.dumps(body).encode()
+        r = urllib.request.Request(self.base + path, data=data, headers=h, method=method or ("GET" if data is None else "POST"))
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.read()
+
+    def chat(self, key="model-key", **extra):
+        return self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}], **extra}, key)
+
+    def test_it_may_use_the_model(self):
+        self.assertEqual(self.chat()[0], 200)
+        self.assertEqual(self.req("/v1/models")[0], 200)
+        self.assertEqual(self.req("/health")[0], 200)
+
+    def test_nothing_else(self):
+        for path in ("/status", "/v1/chat-store", "/config", "/settings", "/mcp", "/v1/runs/x", "/slots", "/props",
+                     "/v1/status", "/metrics/prometheus"):
+            code, body = self.req(path)
+            self.assertEqual(code, 403, path)
+            self.assertIn(b"model only", body)
+        for path in ("/config", "/settings", "/convert", "/load", "/v1/subagent", "/v1/chat-store", "/v1/vram",
+                     "/slots/0", "/v1/runs/x/cancel", "/v1/images/generations"):
+            self.assertEqual(self.req(path, {})[0], 403, path)
+
+    def test_without_a_key_nothing(self):
+        self.assertEqual(self.chat(key=None)[0], 401)
+        self.assertEqual(self.req("/v1/chat-store", key=None)[0], 401)
+
+    def test_the_full_key_is_unchanged(self):
+        self.assertEqual(self.chat(key="full-key")[0], 200)
+        self.assertEqual(self.req("/status", key="full-key")[0], 200)
+
+    def test_it_may_not_restart_the_server(self):
+        self.assertEqual(self.req("/restart", {})[0], 403)
+        self.assertFalse(self.svc.restart_requested.is_set())
+
+    def test_holds_only_its_own(self):
+        lid = "cd" * 16
+        allowed = [("/lease", {"cmd": "x", "cwd": ".", "mode": "full", "session": None}),
+                   (f"/lease/{lid}/renew", {}), (f"/lease/{lid}/end", {"exit": 0}),
+                   (f"/lease/{lid}/woken", {}), ("/lease/session-woken", {"agent": "claude", "id": "s"})]
+        for path, body in allowed:           # past the key check (this mock server has no hibernate_dir: 400 is fine)
+            self.assertNotEqual(self.req(path, body)[0], 403, (path, body))
+        refused = [("/unload", {}), ("/unload", {"save": True}), ("/unload", {"hold_pids": [os.getpid()]}),
+                   ("/unload", {"save": True, "hold_pids": [os.getpid()], "fresh": True}),
+                   (f"/lease/{lid}/stop", {}), ("/lease/stop", {"all": True})]
+        for path, body in refused:
+            self.assertEqual(self.req(path, body)[0], 403, (path, body))
+
+    def test_server_side_tools_are_dropped(self):
+        seen = {}
+        real = self.svc.begin_request
+
+        def spy(path, req):
+            seen.update(req)
+            return real(path, req)
+
+        with mock.patch.object(self.svc, "begin_request", spy):
+            self.assertEqual(self.chat(strata_mcp=True, strata_run=True, strata_effort="low")[0], 200)
+        self.assertNotIn("strata_mcp", seen)
+        self.assertNotIn("strata_run", seen)
+        self.assertEqual(seen.get("strata_effort"), "low")             # sampling options stay
+
+    def test_images_only_as_data_urls(self):
+        for url in ("file:///C:/Users/someone/secret.png", "C:/Users/someone/secret.png", "https://example.com/a.png"):
+            msg = [{"role": "user", "content": [{"type": "text", "text": "what is it"},
+                                                {"type": "image_url", "image_url": {"url": url}}]}]
+            code, body = self.req("/v1/chat/completions", {"model": "m", "messages": msg})
+            self.assertEqual(code, 400, url)
+            self.assertIn(b"data: URLs only", body)
+
+
+class ApiKeyFile(unittest.TestCase):
+    """local: the keys file and main()'s "api_key_file"."""
+
+    def test_parse(self):
+        from serve.server import api_keys_from_file
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "keys.json"
+            p.write_text('{"full": [" a "], "model": ["b"]}', encoding="utf-8")
+            self.assertEqual(api_keys_from_file(p), (["a"], ["b"]))
+            for bad in ('{"full": ["a"], "model": ["a"]}', '{"full": [""]}', '{"admin": ["x"]}', '["a"]', '{"model": "b"}'):
+                p.write_text(bad, encoding="utf-8")
+                with self.assertRaises(ValueError, msg=bad):
+                    api_keys_from_file(p)
+
+    def test_main_loads_it(self):
+        import serve.server as S
+        seen = {}
+
+        def fake_serve(svc, host=None, port=None):
+            seen["key"], seen["model"] = svc.api_key, svc.model_keys
+            raise _Reached
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ), mock.patch.object(S, "serve", fake_serve):
+            os.environ.pop("STRATA_API_KEY", None)
+            keys = Path(d) / "keys.json"
+            keys.write_text('{"full": ["f"], "model": ["m"]}', encoding="utf-8")
+            p = Path(d) / "cfg.json"
+            p.write_text(json.dumps({"api_key_file": str(keys)}), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["server.py", "--engine", "mock", "--port", "0", "--config", str(p)]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(_Reached):
+                    S.main()
+        self.assertEqual(seen, {"key": ["f", "m"], "model": ["m"]})
+
+
+class HealthShowsWhoOnlyToTheFullKey(unittest.TestCase):
+    """local: /health needs no key, so who is working (session titles, a helper's task) and what holds the model (job
+    commands, folders) are left out unless the request carries a full key."""
+
+    def test_it(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.api_key, svc.model_keys = ["full-key", "model-key"], ["model-key"]
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}/health"
+
+        def get(key):
+            h = {"Authorization": "Bearer " + key} if key else {}
+            with urllib.request.urlopen(urllib.request.Request(base, headers=h), timeout=10) as r:
+                return json.loads(r.read())
+
+        try:
+            with mock.patch.object(svc, "requests_now", lambda: [{"session": "s", "title": "secret task"}]), \
+                    mock.patch.object(svc, "held_by", lambda: [{"id": "cd" * 16, "cmd": "python secret.py",
+                                                                "cwd": "C:\\secret", "session": None, "mode": "full",
+                                                                "age_s": 3.0}]):
+                for key in (None, "model-key", "wrong"):
+                    h = get(key)
+                    self.assertNotIn("requests", h, key)
+                    self.assertNotIn("holders", h, key)                  # the pid descriptions are gone
+                    self.assertEqual(h["held_by"][0]["cmd"], "python secret.py")   # what holds it still shows
+                h = get("full-key")
+                self.assertEqual(h["requests"][0]["title"], "secret task")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()

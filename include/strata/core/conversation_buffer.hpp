@@ -3,10 +3,13 @@
 #include "strata/core/progress.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <new>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -92,6 +95,40 @@ public:
         }
     }
     void pop_back() { resize(size_ - 1); }
+    // An empty buffer grown to `n` bytes with its segments allocated and zero-filled by up to `threads` threads at
+    // once: a large read's destination, whose fresh pages one thread faulted in one after another (1.25 GB: ~230 ms
+    // on one thread, ~20 ms on 12).  The same contents and segments as resize(n).  Not empty: resize(n).
+    void resize_fresh(size_t n, unsigned threads) {
+        if (size_ != 0 || n <= segment_bytes || threads < 2) { resize(n); return; }
+        const size_t count = n / segment_bytes + (n % segment_bytes != 0);
+        segments_.resize(count);
+        std::atomic<size_t> next{0};
+        std::atomic<bool> failed{false};
+        auto fill = [&] {
+            for (size_t k; !failed && (k = next.fetch_add(1)) < count;) {
+                const size_t bytes = std::min(segment_bytes, n - k * segment_bytes);
+                try {
+                    segments_[k].reserve(bytes);
+                    segments_[k].resize(bytes);
+                } catch (...) {   // out of memory on a worker: thrown again on the caller's thread below
+                    failed = true;
+                }
+            }
+        };
+        std::vector<std::thread> pool;
+        try {
+            for (unsigned t = 1; t < threads && t < count; ++t) pool.emplace_back(fill);
+        } catch (...) {}   // fewer threads: this one fills the rest
+        fill();
+        for (auto& t : pool) t.join();
+        if (failed) {
+            segments_.clear();
+            segments_.shrink_to_fit();
+            throw std::bad_alloc();
+        }
+        size_ = n;
+        progress_beat();
+    }
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
