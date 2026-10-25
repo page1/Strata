@@ -68,6 +68,14 @@ python tools\strata_suspend.py stop --id <lease id>
 For opencode, copy `tools/opencode-local` into `%USERPROFILE%\.config\opencode\` and edit the Python and Strata
 paths in `command/strata-*.md` to your Strata folder.
 
+## Teach your agents
+
+Your agents won't use the wrapper unless you tell them to: without it, an agent just runs `python train.py` into
+a GPU the model still holds. Paste the block from [docs/AGENT_INSTRUCTIONS.md](docs/AGENT_INSTRUCTIONS.md) into
+your `CLAUDE.md` (Claude Code) or `AGENTS.md` (opencode), with your Strata folder in the paths. It tells the agent
+when to wrap a job, the exact command, to give it a long timeout, not to rerun a job the user stopped, and what
+the wake-up note after a crash means.
+
 ## Windows notes
 
 - Native Windows throughout: the build (CUDA + MSVC via `setup.py --build`), the server, the wrapper.
