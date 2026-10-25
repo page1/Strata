@@ -56,7 +56,8 @@ run, a simulation, an ML pipeline - that need the same GPU and RAM the model hol
          "--conversation-disk-persist", "on"]
 ```
 
-   Optional: `"leases_dir"` (default: `leases` inside the hibernate folder) and `"lease_expire_s"` (default 45).
+   Optional: `"leases_dir"` (default: `leases` inside the hibernate folder), `"lease_expire_s"` (default 45) and
+   `"lease_resume_wait_s"` (default 300: how long a waiting request also waits for the model to come back after a job).
 4. Start Strata as upstream's README says, then run a heavy job through the wrapper:
 
 ```
@@ -102,11 +103,15 @@ the wake-up note after a crash means.
   the real heartbeat file, or talk to a Strata already running on port 8080.
 - Flaky tests: each one found was traced to its cause and fixed. The hold suites passed 16 of 16 runs, two at a
   time in parallel; the MCP suite 5 of 5 and its stop test 15 of 15 under that load.
+- A request that waited out a job's lease could still get a 503 when the model's return after the job had to wait
+  for the job's memory to show as free (seen once in a live test; the model came back by itself 5 s later). Such a
+  request now waits for that too, for up to `"lease_resume_wait_s"` (default 300 s).
 
 ## Known issues
 
-- `strata_start` on Windows: if the launcher ends while the server is still starting, the server under it is not
-  tracked and may keep its port (same cause as the stop fix above, on the start path). Not fixed yet.
+None open. (An earlier note here said `strata_start` lost track of the server if the venv launcher ended during a
+start. Measured since: the launcher keeps its child in a kill-on-close job, so the server ends with it and nothing
+is left on the port; a test now checks that.)
 
 ## Credits
 

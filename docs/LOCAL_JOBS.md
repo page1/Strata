@@ -2,7 +2,9 @@
 
 A job run through `tools/strata_suspend.py run` (or `launch`) holds Strata with a lease: the model gives its memory
 to the job, and every request waits until the job's lease ends. Then the model comes back by itself. While that
-happens, the web page's Monitor shows **Locked**, and `status` says so.
+happens, the web page's Monitor shows **Locked**, and `status` says so. If the job's memory is not free yet when its
+lease ends, the model comes back as soon as it is, and the waiting requests wait for that too, for up to
+`"lease_resume_wait_s"` (run config, default 300 s); after that they are answered 503 again until the model is back.
 
 ## See what holds it
 

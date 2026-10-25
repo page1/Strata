@@ -337,6 +337,105 @@ class LeaseServer(unittest.TestCase):
         self.assertIn("ok", text)
         self.assertEqual(self.svc.lease_live(), [])
 
+    # ------------------------------------------------------------ the resume after the lease waits for memory
+
+    def _memory_short_until(self, free):
+        """The job's memory shows as free only once `free` is set: until then the resume after the lease waits."""
+        real = self.svc.resume_blocked
+        self.svc.resume_blocked = lambda: real() if free.is_set() else "1000 MiB of RAM available, it needs 50000"
+        self.addCleanup(setattr, self.svc, "resume_blocked", real)
+
+    def test_a_request_that_waited_out_a_lease_also_waits_out_the_resume(self):
+        """Live test 1 (Oct 23): the lease ended, the resume found the job's memory not free yet, and the waiting
+        request was answered 503 although the model came back by itself 5 s later.  It must wait for that resume."""
+        b, free, out = self.lease("full"), threading.Event(), {}
+        self._memory_short_until(free)
+
+        def ask():
+            out["r"] = self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user",
+                                                                                    "content": "hi"}]}, timeout=60)
+        th = threading.Thread(target=ask, daemon=True)
+        th.start()
+        time.sleep(1.0)
+        self.req(f"/lease/{b['id']}/end", {"exit": 0})   # the end route's own resume fails: the memory is short
+        time.sleep(2.0)
+        self.assertNotIn("r", out)                       # it waits for the resume, no 503
+        self.assertFalse(self.engine.running)
+        free.set()
+        th.join(30)
+        self.assertEqual(out["r"][0], 200, out["r"])
+        self.assertTrue(self.engine.running)
+
+    def test_a_stream_that_waited_out_a_lease_also_waits_out_the_resume(self):
+        import socket
+        import serve.server as server
+        b, free = self.lease("full"), threading.Event()
+        self._memory_short_until(free)
+        body = json.dumps({"model": "m", "stream": True, "messages": [{"role": "user", "content": "hi"}]}).encode()
+        with mock.patch.object(server, "KEEPALIVE_S", 0.3):
+            c = socket.create_connection(("127.0.0.1", self.httpd.server_address[1]))
+            self.addCleanup(c.close)
+            c.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                      b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+            time.sleep(1.0)
+            self.req(f"/lease/{b['id']}/end", {"exit": 0})
+            threading.Timer(2.0, free.set).start()
+            c.settimeout(30)
+            got = b""
+            while b"[DONE]" not in got:
+                got += c.recv(65536)
+        text = got.decode(errors="replace")
+        self.assertNotIn('"error"', text)                # no error event: it waited the resume out
+        self.assertIn("ok", text)
+        self.assertTrue(self.engine.running)
+
+    def test_a_lease_after_the_load_also_waits_out_the_resume(self):
+        """The generate path's wait (a lease started between the request's load and its generation): after the lease
+        the resume waits for memory; the request waits for it too and is answered 200."""
+        real_load, box, free = self.svc.load, [], threading.Event()
+        self._memory_short_until(free)
+
+        def load(*a, **kw):
+            r = real_load(*a, **kw)
+            if not box:
+                box.append(self._lease_now())
+            return r
+        self.svc.load = load
+        self.addCleanup(setattr, self.svc, "load", real_load)
+
+        def end_later():
+            time.sleep(1.0)
+            self.req(f"/lease/{box[0]}/end", {"exit": 0})
+            time.sleep(2.0)
+            free.set()
+        threading.Thread(target=end_later, daemon=True).start()
+        t0 = time.time()
+        s, b = self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+                        timeout=60)
+        self.assertEqual(s, 200, b)
+        self.assertGreater(time.time() - t0, 2.5)        # it waited for the memory, not only the lease
+        self.assertTrue(self.engine.running)
+
+    def test_the_wait_for_the_resume_is_bounded(self):
+        """Memory that never comes free (another program took it): after lease_resume_wait_s the request is answered
+        503 as before, and later requests are not held either; the watcher keeps trying the resume."""
+        self.svc.lease_resume_wait_s = 1.0
+        b, never = self.lease("full"), threading.Event()
+        self._memory_short_until(never)
+        self.req(f"/lease/{b['id']}/end", {"exit": 0})
+        t0 = time.time()
+        s, _ = self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+                        timeout=30)
+        self.assertEqual(s, 503)
+        self.assertLess(time.time() - t0, 10)
+        t0 = time.time()
+        s, _ = self.req("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+                        timeout=30)
+        self.assertEqual(s, 503)
+        self.assertLess(time.time() - t0, 0.9)           # past the bound: not held again
+        self.assertTrue(self.svc.lease_table().resume_pending())   # the watcher still has it to do
+        self.assertFalse(self.engine.running)
+
     def test_a_lease_during_a_resume_counts_the_model_as_loaded(self):
         """The first lease ended and its resume is under way (the model is not up yet): a lease created now must
         count the model as loaded (lease_model_loaded()), else it records resume_model False and the model stays

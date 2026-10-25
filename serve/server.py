@@ -3192,6 +3192,8 @@ class Service:
         self.leases_dir = None                           # the table's folder (default <hibernate_dir>/leases)
         self.lease_clock = time.time                     # the clock the table is opened with (tests fake it)
         self.lease_expire_s = 45.0                       # "lease_expire_s" in the run config
+        self.lease_resume_wait_s = 300.0                 # "lease_resume_wait_s": a request waits this long for the
+        self._lease_resume_since = None                  # resume after the leases (the memory may not be free yet)
         self._lease_table = None                         # the LeaseTable, opened on first use
         self._lease_last_pass = None                     # lease_clock() at the previous lease_pass()
         self._lease_resume_in_flight = False             # a lease_pass()'s ensure_loaded(resume=True) is under way
@@ -3456,6 +3458,38 @@ class Service:
             return self.lease_pass()
         except Exception:  # noqa: BLE001
             return ""
+
+    def lease_resume_waits(self) -> bool:
+        """The leases ended and their resume has not run yet (the job's memory was not free): a request waits for it,
+        as it waited for the lease, for up to lease_resume_wait_s from when the resume was first seen pending.  One
+        clock for every request: past it, requests are answered (503) again while the watcher keeps trying."""
+        try:
+            pending = self._lease_table is not None and self._lease_table.resume_pending()
+        except Exception:  # noqa: BLE001
+            pending = False
+        if not pending or self.loaded():
+            self._lease_resume_since = None
+            return False
+        if self._lease_resume_since is None:
+            self._lease_resume_since = time.monotonic()
+        return time.monotonic() - self._lease_resume_since < self.lease_resume_wait_s
+
+    def lease_waits(self) -> bool:
+        """A request waits: a lease holds the model, or the resume after the leases is still to come."""
+        return self.lease_holds() or self.lease_resume_waits()
+
+    def lease_still_waits(self) -> bool:
+        """One step of a request's wait on the leases (call it about once a second, not holding the fifo): True
+        while a lease holds the model, or while only the resume after it is to come - each such step tries that
+        resume again (a lease pass), so the request goes on as soon as the memory is free."""
+        if self.loaded():
+            return False
+        if self.lease_holds():
+            return True
+        if self.lease_resume_waits():
+            self.lease_pass_quietly()
+            return not self.loaded()
+        return False
 
     def lease_drop_pending_resume(self) -> None:
         """A deliberate hibernate (the web page's, not a job's): a resume still pending from ended leases (the memory
@@ -5066,12 +5100,12 @@ class Service:
                                 # while holding it would deadlock.  A parallel request holds no turn: it waits
                                 # the lease out where it is (pings on a stream, a cancel ends it) and tries the
                                 # load again.  A GpuBusy that is not a lease answers as today.
-                                if not self.lease_holds():
+                                if not self.lease_waits():
                                     raise
                                 if par:
                                     self.this_request_is("waiting out a hold")   # local: the request list
                                     last = time.monotonic()
-                                    while self.lease_holds() and not self.loaded():
+                                    while self.lease_still_waits():
                                         if cancel.is_set():
                                             with self.status_lock:
                                                 self.status["queued"] -= 1
@@ -5088,7 +5122,7 @@ class Service:
                                 give_turn_back()
                                 self.this_request_is("waiting out a hold")   # local: the request list
                                 last = time.monotonic()
-                                while self.lease_holds() and not self.loaded():
+                                while self.lease_still_waits():
                                     if cancel.is_set():
                                         yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0,
                                                        "timings": None, "reasoning_tokens": 0,
@@ -7414,15 +7448,16 @@ def make_handler(svc: Service):
             -> "" (no hold, or it waited without a stream: the caller loads as usual), "started" (the stream is
             started and the model loaded) or "answered" (the client left, or the load failed - said in the stream)."""
             self.sse_started = False
-            if svc.loaded() or not svc.lease_holds():
+            if svc.loaded() or not svc.lease_waits():
                 return ""
             print("[strata] a request waits for the job that holds the model (a lease)", flush=True)
+            held = svc.lease_still_waits
             with svc.status_lock:
                 svc.status["held_waiting"] = svc.status.get("held_waiting", 0) + 1
             svc.agent_state(getattr(self, "agent_sid", None), "waiting out a hold")
             try:
                 if not stream:
-                    while svc.lease_holds() and not svc.loaded():
+                    while held():
                         time.sleep(1.0)
                     svc.lease_pass_quietly()                            # the leases ended: resume as the watcher does
                     return ""
@@ -7441,7 +7476,7 @@ def make_handler(svc: Service):
 
                 while True:
                     last = 0.0
-                    while svc.lease_holds() and not svc.loaded():
+                    while held():
                         if time.monotonic() - last >= KEEPALIVE_S:
                             self.wfile.write(b": keep-alive (Strata is held for a running job; this request waits)\n\n")
                             self.wfile.flush()
@@ -7452,7 +7487,7 @@ def make_handler(svc: Service):
                         svc.load()
                         break
                     except GpuBusy as e:
-                        if svc.loaded() or not svc.lease_holds():
+                        if svc.loaded() or not svc.lease_waits():
                             return stream_error(e)
                         # local: a second lease started right after the first ended, while this stream waited:
                         # wait it out too, keep-alives and all, instead of ending the stream with an error
@@ -7476,7 +7511,7 @@ def make_handler(svc: Service):
                     svc.load()
                     return ""
                 except GpuBusy:
-                    if svc.loaded() or not svc.lease_holds():
+                    if svc.loaded() or not svc.lease_waits():
                         raise
                     w = self._wait_for_hold(stream, api)
                     if w:
@@ -8865,6 +8900,11 @@ def main() -> int:
             svc.lease_expire_s = float(cfg["lease_expire_s"])
         except (TypeError, ValueError):
             raise SystemExit("[strata] config \"lease_expire_s\" must be a number of seconds")
+    if cfg.get("lease_resume_wait_s") is not None:
+        try:
+            svc.lease_resume_wait_s = float(cfg["lease_resume_wait_s"])
+        except (TypeError, ValueError):
+            raise SystemExit("[strata] config \"lease_resume_wait_s\" must be a number of seconds")
     if svc._leases_folder() is not None:                # local: open the lease table now, so a save checkpoints and
         try:                                            # a live lease holds from the first request on
             svc.lease_table()

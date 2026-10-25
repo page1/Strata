@@ -493,6 +493,36 @@ class StartStop(FakeRoot):
         st, _ = self.call("strata_status", {"hardware": False})
         self.assertEqual(st["running"], [])
 
+    def _launcher_and_server(self):
+        """The tracked process (the launcher on Windows) and the real server, once both run; skips where they are one."""
+        self.assertTrue(wait_for(lambda: (self.root / "server.pid").exists(), 30))
+        server = int((self.root / "server.pid").read_text())
+        tracked = self.strata.state("server")
+        if tracked["pid"] == server:
+            self.skipTest("the server is not started through a launcher here (only the venv launcher on Windows)")
+        return tracked, server, M.proc_identity(server)
+
+    def test_a_launcher_that_ends_while_starting_takes_its_server_along(self):
+        # The case FORK.md listed as a gap: the launcher ends while the server under it still loads.  The venv
+        # launcher keeps its child in a kill-on-close job, so the server ends with it: the start says it stopped, and
+        # nothing is left running untracked or answering on the port.  If this ever fails, the server outlived its
+        # launcher, and strata_start must then track the server itself.
+        port = free_port()
+        self.write_config("q2_0", port=port, delay=4)
+        out = {}
+        th = threading.Thread(target=lambda: out.update(r=self.call("strata_start", {"wait_seconds": 30})))
+        th.start()
+        tracked, server, ident = self._launcher_and_server()
+        M.proc_terminate(tracked["pid"], tracked["ident"])
+        th.join(60)
+        res, err = out["r"]
+        self.assertTrue(err, res)
+        self.assertIn("stopped while starting", res["error"])
+        self.assertTrue(wait_for(lambda: not M.proc_alive(server, ident), 10), "the server outlived its launcher")
+        time.sleep(5)                                          # past the fake server's load: it would listen now
+        self.assertIsNone(self.strata.probe(port, deep=False))
+        self.assertFalse(self.strata.state("server"))         # the record is cleared
+
     def test_start_reports_a_crash(self):
         self.write_config("q2_0", port=free_port(), crash=True)
         res, err = self.call("strata_start", {"wait_seconds": 30})

@@ -261,6 +261,11 @@ class LeaseTable:
                     out.append(dict(lease))
             return out
 
+    def resume_pending(self) -> bool:
+        """Ended leases left a resume to do that has not run yet (no lease holds now)."""
+        with self._lock:
+            return self._resume_pending and not self._live()
+
     def restore_resume(self) -> None:
         """A resume that could not run (the memory was not free): put the pending flag back for the next pass."""
         with self._lock:
