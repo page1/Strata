@@ -184,6 +184,35 @@ So on screenshots the NPU is about as fast as the CPU reader with 12 threads and
 3090, but it takes no VRAM, almost no CPU, and the least energy per picture of the three.  It suits pictures read
 in the background, or a PC where the GPU's memory is worth more to the model than picture speed.
 
+## In this fork (page1/Strata): the vision section's `"npu"`
+
+This fork's server (0.1.44.1) has no `cpu_exe` fallback, so it takes the NPU reader through one setting of its own
+in the run config's `vision` section.  Without the setting nothing changes.  With it, the server tries the NPU reader
+first; if this PC has no NPU, no driver or no OpenVINO, the reader answers one `ERR` line, the server prints one line
+and starts the section's own reader (`exe`, the CPU or GPU `strata-vision`) as it always did.  It doesn't try the NPU
+again until the server restarts.
+
+```json
+"vision": {
+  "exe": "C:\\Strata\\engine\\strata-vision.exe", "mmproj": "...", "model": "...", "gpu": false,
+  "max_tokens": 2048,
+  "npu": {"anysize": "C:\\Strata-data\\npu-vision\\anysize",
+          "cache_dir": "C:\\Strata-data\\npu-vision\\cache"}
+}
+```
+
+- `anysize`: an export of `tools/vision/npu_anysize.py` (the section above), or `model_ir` for the fixed 768x768
+  IR.  One of the two is needed.
+- `python`: a Python with OpenVINO.  The default is `.venv-npu` in the Strata folder (`python -m venv .venv-npu`, then
+  `.venv-npu\Scripts\python -m pip install -r requirements-npu.txt`), else the server's own Python.
+- `cache_dir`: OpenVINO's compile cache.  Without it every server start compiles for about 2 minutes.
+- `device`: `NPU` by default.  `"enabled": false` turns the setting off and keeps it in the file.
+- `max_tokens` and `min_tokens` come from the section, as for the other readers.  With `anysize`, `max_tokens` must
+  not be above the export's largest budget (2048 by default), or the NPU reader refuses and the own reader is used.
+- With `"gpu": true` the own reader is the GPU one, and the engine keeps VRAM free for it even while the NPU reads
+  the pictures.  For the NPU with the CPU reader as its fallback, keep `"gpu": false`.  Don't combine `"npu"` with
+  `"elastic"`: the first picture would still make the expert cache keep VRAM free that the NPU doesn't use.
+
 ## Using it as the server's picture reader (opt-in)
 
 The server starts whatever one exe its `vision` section names.  To read pictures on the NPU:

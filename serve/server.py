@@ -2278,6 +2278,43 @@ def vision_start_error(line: str, log=None) -> str:
     return "the vision encoder did not start: " + text
 
 
+def npu_reader_args(cfg: dict) -> list | None:
+    """The Intel NPU picture reader's command line from the vision section's "npu" object, or None when the section
+    has none (the default: nothing changes) or it says "enabled": false.  docs/INTEL_NPU.md, "In this fork".
+
+        "npu": {"anysize": "<an npu_anysize.py export>"  (or "model_ir": "<encoder.xml>"),
+                "python": "<a Python with openvino>"     (default: .venv-npu next to this checkout, else this Python),
+                "cache_dir": "<OpenVINO's compile cache>", "device": "NPU"}
+
+    The reader is tools/vision/strata_vision_npu.py; it takes the section's max_tokens / min_tokens like the other
+    readers.  Without an NPU, its driver or OpenVINO it answers one ERR line, and Vision starts the section's own
+    reader instead."""
+    npu = cfg.get("npu")
+    if not isinstance(npu, dict) or npu.get("enabled") is False:
+        return None
+    root = Path(__file__).resolve().parents[1]
+    venv = root / ".venv-npu" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    py = npu.get("python") or (str(venv) if venv.exists() else sys.executable)
+    args = [py, "-I", str(root / "tools" / "vision" / "strata_vision_npu.py")]
+    if npu.get("anysize"):
+        args += ["--anysize", os.path.abspath(npu["anysize"])]
+    elif npu.get("model_ir"):
+        args += ["--model-ir", npu["model_ir"]]
+    else:
+        print('[strata] images: the vision section\'s "npu" names neither "anysize" nor "model_ir": the NPU reader '
+              "is off", flush=True)
+        return None
+    if npu.get("cache_dir"):
+        args += ["--cache-dir", os.path.abspath(npu["cache_dir"])]
+    if npu.get("device"):
+        args += ["--device", str(npu["device"])]
+    if cfg.get("max_tokens"):
+        args += ["--max-tokens", str(cfg["max_tokens"])]
+    if cfg.get("min_tokens"):
+        args += ["--min-tokens", str(cfg["min_tokens"])]
+    return args
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
@@ -2316,6 +2353,13 @@ class Vision:
             args += ["--min-tokens", str(cfg["min_tokens"])]
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
+        # opt-in (the section's "npu"): the Intel NPU reader is tried first; when it cannot start (no NPU, driver or
+        # OpenVINO: one ERR line) the section's own reader starts instead, and the NPU is not tried again this run
+        self.npu_args = npu_reader_args(cfg)
+        self.npu_failed = False
+        if self.npu_args and cfg.get("elastic") is True:
+            print('[strata] images: "elastic" is for a GPU reader: with "npu" too, the first picture still makes the '
+                  "expert cache keep VRAM free, which the NPU reader does not use; leave one of them off", flush=True)
         self.proc = None
         self.stopped = True
         self.lock = threading.Lock()
@@ -2330,7 +2374,20 @@ class Vision:
             self._start()
 
     def _start(self):
-        args, log, env = self.spawn
+        npu = getattr(self, "npu_args", None)
+        if npu and not self.npu_failed:
+            try:
+                self._spawn(npu)
+                print("[strata] images: the picture reader runs on the Intel NPU", flush=True)
+                return
+            except RuntimeError as e:
+                self.npu_failed = True
+                print(f"[strata] images: the NPU reader did not start ({e}); the vision section's own reader "
+                      "is used instead", flush=True)
+        self._spawn(self.spawn[0])
+
+    def _spawn(self, args: list):
+        _, log, env = self.spawn
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,

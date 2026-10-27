@@ -38,6 +38,7 @@ run, a simulation, an ML pipeline - that need the same GPU and RAM the model hol
 | Web chat additions | Attach PDF/Office files (`POST /convert`, MarkItDown), detached runs, queued messages, Compact, subagents, a chat store shared by every device | [DETAILS.md](docs/DETAILS.md) "PDFs and Office files in the chat page"; the rest is not documented yet |
 | opencode plugin + commands | Continues turns that ended empty; `/strata-free-all`, `/strata-free-ram`, `/strata-resume`, `/strata-status` | [LOCAL_PERFORMANCE.md](docs/LOCAL_PERFORMANCE.md) §10 |
 | Faster engine start (Windows) | `STRATA_EARLY_ARENA=1` (opt-in), plus prefaulting and threaded dense uploads (on by default); `STRATA_POOL_PIN=hard` | [LOCAL_PERFORMANCE.md](docs/LOCAL_PERFORMANCE.md) §1-2; the switches are described in the code comments |
+| Pictures on an Intel NPU (opt-in) | sibnick's NPU picture reader (OpenVINO), plus pictures at any size (`--anysize`); the vision section's `"npu"` turns it on, and a PC without an NPU falls back to the normal reader | [INTEL_NPU.md](docs/INTEL_NPU.md), "In this fork" |
 
 ## Install (Windows)
 
@@ -69,6 +70,23 @@ python tools\strata_suspend.py stop --id <lease id>
 For opencode, copy `tools/opencode-local` into `%USERPROFILE%\.config\opencode\` and edit the Python and Strata
 paths in `command/strata-*.md` to your Strata folder.
 
+### Optional: read pictures on an Intel NPU
+
+Only for a Core Ultra PC with an NPU (Intel AI Boost) and its driver. Off unless you set it; without an NPU the
+setting falls back to the normal picture reader.
+
+1. In the Strata folder: `python -m venv .venv-npu`, then `.venv-npu\Scripts\python -m pip install -r requirements-npu.txt`.
+2. Export the picture encoder once: `.venv-npu\Scripts\python tools\vision\npu_anysize.py export <your mmproj .gguf>
+   --out-dir C:\Strata-data\npu-vision\anysize`.
+3. Add `"npu": {"anysize": "C:\\Strata-data\\npu-vision\\anysize", "cache_dir": "C:\\Strata-data\\npu-vision\\cache"}`
+   to the run config's `"vision"` section, and restart Strata. The first start compiles for about 2 minutes; later
+   starts take about 5 s.
+
+What to expect, measured on the PC above: a full-size app screenshot (about 2000 tokens) takes about 25 s on the NPU,
+the same as the CPU reader with 12 threads, against under 1 s for the RTX 3090's reader. The NPU uses no VRAM,
+almost no CPU, and about half the energy per picture of the GPU. It is for pictures read in the background, or when
+the GPU's memory matters more than picture speed. The full numbers are in [INTEL_NPU.md](docs/INTEL_NPU.md).
+
 ## Teach your agents
 
 Your agents won't use the wrapper unless you tell them to: without it, an agent just runs `python train.py` into
@@ -92,6 +110,11 @@ the wake-up note after a crash means.
   tests against the running server - a job's lease unloads the model, a request sent during it waits and is
   answered after it, overlapping jobs, a killed wrapper (its job gone in 0.5 s, the lease expired after ~44 s), a
   server restart during a job, a forced load, three jobs started together.
+- **Intel NPU reader (Windows 11, the PC above, NPU 3720, driver 32.0.100.5540, OpenVINO 2026.4.1)**: sibnick's
+  reader and test suites, the any-size export and reader on the NPU (10 screenshots, against the CPU and GPU readers,
+  with energy), and the vision section's `"npu"` and its fallback with unit tests. Not tested: the `"npu"` setting
+  in a live server start (the any-size reader ran live on the NPU through the reader protocol, and sibnick's
+  fixed-size reader answered pictures as a running server's `vision.exe`), other NPUs and drivers, Linux.
 - **Linux**: only that a killed wrapper takes its job with it (Ubuntu under WSL).
 - **Not tested**: other GPUs, AMD (HIP), Intel (SYCL), multi-GPU, macOS.
 
@@ -115,6 +138,8 @@ is left on the port; a test now checks that.)
 
 ## Credits
 
-The disk tier is xrip's work (upstream #1937). Fixes from review by midhatn and K8nsch. Strata itself is
+The disk tier is xrip's work (upstream #1937). The Intel NPU picture reader, its exporter and its container are
+sibnick's (`npu-vision-reader`, offered upstream in #678); this fork adds the any-size export and the `"npu"`
+setting. Fixes from review by midhatn and K8nsch. Strata itself is
 Niko1221's and its contributors' (MIT license, unchanged). The fork's changes were written with Claude Code and
 local agents, and reviewed and tested by its author.
