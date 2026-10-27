@@ -26,13 +26,18 @@ dynamic H, W works on the platforms whose NPU compiler takes them, and the reade
 --max-tokens or --image-size.
 
     python tools/vision/strata_vision_npu.py --model-ir encoder.xml [--device NPU] [--cache-dir DIR] [--embd N]
+    python tools/vision/strata_vision_npu.py --anysize DIR [--max-tokens N] [--device NPU] [--cache-dir DIR]
     python tools/vision/strata_vision_npu.py --mock              # deterministic stand-in, no OpenVINO or NPU needed
+
+--anysize reads an export of tools/vision/npu_anysize.py instead of one IR: every picture keeps its aspect ratio
+and is sized the way mtmd sizes it (up to --max-tokens, default the export's largest budget), as the CPU and GPU
+readers do, instead of being squeezed into the one size the IR was exported for.
 
 The flags the server hands every reader (--mmproj, --model, --gpu, --threads, --max-tokens, --min-tokens,
 --flash-attn) are accepted so a run config's vision section can name this program; only --threads (on --device
 CPU) and --max-tokens / --min-tokens (with a dynamic IR input shape) carry meaning here.  A run config cannot add
-flags to a reader, only an exe, so --model-ir, --device, --cache-dir and --mock also read
-STRATA_VISION_NPU_MODEL_IR, STRATA_VISION_NPU_DEVICE, STRATA_VISION_NPU_CACHE_DIR and
+flags to a reader, only an exe, so --model-ir, --anysize, --device, --cache-dir and --mock also read
+STRATA_VISION_NPU_MODEL_IR, STRATA_VISION_NPU_ANYSIZE, STRATA_VISION_NPU_DEVICE, STRATA_VISION_NPU_CACHE_DIR and
 STRATA_VISION_NPU_MOCK from the server's environment.
 
 Unlike the GPU readers this one never quietly becomes something else: with no NPU, no OpenVINO or an unreadable IR
@@ -312,6 +317,66 @@ class OpenVinoEngine:
             pass
 
 
+class AnySizeEngine:
+    """An npu_anysize.py export on the NPU: one compiled graph set per token budget, and each picture at its own
+    size (mtmd's sizing, up to max_tokens), padded to the smallest budget that holds it."""
+
+    def __init__(self, export_dir: str, device: str, cache_dir: str | None, max_tokens: int, min_tokens: int):
+        try:
+            import openvino as ov
+        except ImportError:
+            raise DeviceError(
+                "OpenVINO is not installed for this Python (pip install openvino); "
+                "or run with --mock to test the reader without one"
+            ) from None
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import npu_anysize
+
+        self.core = ov.Core()
+        available = list(self.core.available_devices)
+        if device.upper() not in [d.upper() for d in available]:
+            raise DeviceError(
+                f"this PC has no {device.upper()} that OpenVINO can see (it sees: "
+                f"{', '.join(available) or 'nothing'}); install the Intel NPU driver, pick another "
+                f"--device, or run the CPU reader strata-vision instead"
+            )
+        self.device = device.upper()
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            self.core.set_property(self.device, {"CACHE_DIR": cache_dir})
+        if not os.path.isfile(os.path.join(export_dir, "anysize.json")):
+            raise ReaderError(
+                f"{export_dir} is not an any-size export (no anysize.json): make one with "
+                "tools/vision/npu_anysize.py export"
+            )
+        try:
+            self.enc = npu_anysize.compile_encoder(export_dir, self.core, self.device, max_tokens, min_tokens)
+        except ValueError as e:
+            raise ReaderError(one_line(e)) from None
+        except Exception as e:
+            raise ReaderError(
+                f"the {self.device} could not read or compile the any-size export {export_dir}: {one_line(e)}"
+            ) from None
+        self.budgets = list(self.enc.side["budgets"])
+        self.max_tokens = self.enc.max_tokens
+
+    @property
+    def n_embd(self) -> int:
+        return self.enc.n_embd
+
+    def encode(self, path: str, mean: tuple, std: tuple) -> tuple["np.ndarray", int, int]:
+        return self.enc.encode(path, mean, std)
+
+    def warm(self) -> None:
+        self.enc.warm()
+
+    def close(self) -> None:
+        try:
+            del self.enc, self.core
+        except Exception:
+            pass
+
+
 def build_engine(args) -> tuple[object, tuple[int, int], int]:
     """(engine, (W, H), n_embd) from the flags, or a ReaderError/DeviceError with the fix in its line."""
     if args.mock:
@@ -321,6 +386,10 @@ def build_engine(args) -> tuple[object, tuple[int, int], int]:
             *size, args.patch_size, args.merge_size
         )  # same config check as the real engine gets
         return eng, size, eng.n_embd
+    anysize = args.anysize or os.environ.get("STRATA_VISION_NPU_ANYSIZE", "")
+    if anysize:
+        eng = AnySizeEngine(anysize, args.device, args.cache_dir, args.max_tokens, args.min_tokens)
+        return eng, None, args.embd or eng.n_embd  # no fixed size: every picture is sized on its own
     ir = args.model_ir or os.environ.get("STRATA_VISION_NPU_MODEL_IR", "")
     if not ir:
         raise ReaderError(
@@ -361,6 +430,16 @@ def encode_one(
     t0 = time.perf_counter()
     if not os.path.isfile(img):
         raise FileNotFoundError(f"cannot read the image {img}")
+    if size is None:  # an any-size engine sizes each picture itself
+        embd, nx, ny = eng.encode(img, mean, std)
+        n = nx * ny
+        if embd.shape != (n, n_embd):
+            raise RuntimeError(f"the encoder answered {embd.shape}, not the ({n}, {n_embd}) its grid promises")
+        data = struct.pack("<5i", SVE1_MAGIC, n, nx, ny, n_embd) + embd.tobytes()
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        with open(out, "wb") as f:
+            f.write(data)
+        return n, nx, ny, (time.perf_counter() - t0) * 1000.0
     tensor = preprocess(img, size[0], size[1], mean, std)
     nx, ny = grid_of(size[0], size[1], patch, merge)
     embd = eng.infer(tensor, nx, ny)
@@ -388,6 +467,12 @@ def main() -> int:
         help="OpenVINO IR of the vision encoder (.xml; .onnx too), or a chain of "
         'two joined with "' + os.pathsep + '" (docs/INTEL_NPU.md); '
         "or STRATA_VISION_NPU_MODEL_IR",
+    )
+    p.add_argument(
+        "--anysize",
+        default="",
+        help="an export of tools/vision/npu_anysize.py: pictures keep their own size (up to --max-tokens) "
+        "instead of the one size of --model-ir; or STRATA_VISION_NPU_ANYSIZE",
     )
     p.add_argument(
         "--device",
@@ -466,7 +551,8 @@ def main() -> int:
         "--max-tokens",
         type=int,
         default=0,
-        help="largest picture grid, used when the IR input is dynamic",
+        help="largest picture grid: with --anysize the most tokens a picture gets (default the export's "
+        "largest budget); with --model-ir used when the IR input is dynamic",
     )
     p.add_argument(
         "--min-tokens", type=int, default=0, help="smallest picture grid, same"
@@ -530,13 +616,18 @@ def main() -> int:
     # graph starts and buffer allocations while a request waits
     try:
         t0 = time.perf_counter()
-        if not isinstance(eng, MockEngine):
-            eng.infer(
-                np.zeros((1, 3, size[1], size[0]), dtype=np.float32),
-                *grid_of(*size, args.patch_size, args.merge_size),
-            )
+        if size is None:
+            eng.warm()
+            shape = f"any size up to {eng.max_tokens} tokens (budgets {', '.join(map(str, eng.budgets))})"
+        else:
+            if not isinstance(eng, MockEngine):
+                eng.infer(
+                    np.zeros((1, 3, size[1], size[0]), dtype=np.float32),
+                    *grid_of(*size, args.patch_size, args.merge_size),
+                )
+            shape = f"{size[0]}x{size[1]}"
         note(
-            f"engine {eng.device}, input {size[0]}x{size[1]}, n_embd {n_embd}, norm "
+            f"engine {eng.device}, input {shape}, n_embd {n_embd}, norm "
             f"{norm[0]} over {norm[1]}, warm encode {time.perf_counter() - t0:.1f} s"
         )
     except Exception as e:

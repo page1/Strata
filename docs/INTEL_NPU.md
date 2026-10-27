@@ -120,12 +120,78 @@ Every process that opens the IR compiles it for the NPU before `READY`: measured
 Inside one server run the reader is resident, so pictures after the first pay none of this: the encode itself
 is 2.2 s with about no CPU while the NPU works.
 
+## Pictures at any size (`--anysize`, opt-in)
+
+The IR above has one input size, 768x768, so every picture is resized to it.  For a photo that is fine.  For a
+screenshot of small text it is not: a 2000x920 screenshot squeezed to 768x768 keeps 38% of its width, its letters
+end up 2-3 pixels wide, and the model guesses words instead of reading them (seen on Windows, 2026-10-26).  The CPU
+and GPU readers keep the aspect ratio and give a picture up to `max_tokens` tokens; `tools/vision/npu_anysize.py`
+does the same on the NPU.
+
+```
+.venv-npu/bin/python tools/vision/npu_anysize.py export \
+    ~/projects/Strata-data/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf --out-dir ~/models/npu-vision/anysize
+.venv-npu/bin/python tools/vision/strata_vision_npu.py --anysize ~/models/npu-vision/anysize \
+    --max-tokens 2048 --cache-dir ~/models/npu-vision/cache          # or STRATA_VISION_NPU_ANYSIZE
+```
+
+How it works:
+
+- The graph knows a token **budget**, not a picture size.  The export compiles a few budgets (default 576, 1024,
+  1536 and 2048 tokens).  The reader sizes each picture the way mtmd does (aspect kept, sides multiples of 32,
+  letterboxed on black, at most `--max-tokens`), and pads it with masked rows to the smallest budget that holds it.
+  The masked rows change nothing: attention never looks at them, and every other step is per row.  The reader
+  hands the graph what depends on the picture's shape: the patches in merged order, the learned positions resized
+  to the grid (bilinear, align corners, as mtmd), and the rope tables.
+- **Attention runs in chunks of 512 query rows.**  A budget of 2048 tokens is 8192 patch rows.  As one score matrix
+  per head (8192 x 8192), one block did not compile in 15 minutes, and the whole encoder did not compile in 9 hours
+  (85 GB of RAM).  In chunks of 512 x 8192 one block compiled in 29 s.  The numbers are the same, because softmax is
+  per query row.  The cliff on this driver lies between about 5.3 and 8.4 million scores in one step.
+  `NPU_COMPILER_TYPE=PLUGIN`, `NPU_COMPILATION_MODE_PARAMS=optimization-level=0/1` and `NPU_TILES=1` did not move
+  it.
+- **One graph runs every block.**  The 27 blocks have one shape, so the export writes one block graph whose weights
+  are fp16 inputs (`blocks.npz`), plus a head (patch embedding) and a tail (merger), and the reader calls the block
+  27 times.  Compiling all four budgets takes about 2 minutes and 2.6 GB of RAM; 27 separate one-block graphs for
+  the 2048 budget alone took 18 minutes and 17.6 GB.  The weights going in as inputs cost about 7% of encode time
+  (6.0 s against 5.6 s at 1024 tokens).
+- Don't compile these graphs with `NPU_TILES=1`.  On the Windows driver below it compiled, then hung the NPU at the
+  first encode (`ZE_RESULT_ERROR_DEVICE_LOST`).  The device recovered, but the reset was felt across the whole PC
+  as an audio glitch.
+
+Measured on Windows (the PC under "What was checked"), 10 app and terminal screenshots from this repository's
+docs, from 800x450 up to 3200x1910, at `--max-tokens 2048`, one resident reader:
+
+| budget used | tokens | NPU per picture | the same pictures, CPU `strata-vision` (12 threads) | GPU `strata-vision --gpu` (RTX 3090) |
+|---|---|---|---|---|
+| 576 | 350-494 | 2.9 s | 2.8-4.2 s | 0.07-0.11 s |
+| 1536 | 1410 | 12.0 s | 15.3 s | 0.50 s |
+| 2048 | 1972-2035 | 24.9-25.2 s | 24.5-25.5 s | 0.90-0.96 s |
+| all 10 | 16,303 | 193 s | 196 s (2 readers x 12 threads: 147 s) | 7.2 s |
+
+(The CPU's per-picture times come from its output files' timestamps; the CPU and GPU readers don't use budgets,
+so their rows are the same pictures.)
+
+- **Accuracy:** cosine per token row against the CPU reader: 0.989868 mean, 1st percentile 0.834 (GPU reader:
+  0.995824, 0.929).  At the native 768x768 the any-size graph computes the same function as the fixed IR.
+- **Energy** (the CPU package power from Windows' Energy Meter, which includes the NPU, and the GPU's
+  `power.draw`): the NPU added 6.7 W over idle, about 143 J per picture.  The GPU added about 293 J per picture
+  (318 W for 9 s), and the CPU 2841 J (214 W).
+- **Startup:** 119 s with an empty `--cache-dir` (all four budgets); 5.3 s to `READY` with it warm.
+- **Parallel:** two pictures at once, from two processes or two threads of one process, gave no gain.  Each took
+  twice as long; the NPU already runs one picture on all of itself.
+
+So on screenshots the NPU is about as fast as the CPU reader with 12 threads and 25-30 times slower than an RTX
+3090, but it takes no VRAM, almost no CPU, and the least energy per picture of the three.  It suits pictures read
+in the background, or a PC where the GPU's memory is worth more to the model than picture speed.
+
 ## Using it as the server's picture reader (opt-in)
 
 The server starts whatever one exe its `vision` section names.  To read pictures on the NPU:
 
-1. Set `STRATA_VISION_NPU_MODEL_IR` (and, if you like, `STRATA_VISION_NPU_DEVICE`) in the environment that starts
-   the server.
+1. Set `STRATA_VISION_NPU_MODEL_IR`, or `STRATA_VISION_NPU_ANYSIZE` for an any-size export (and, if you like,
+   `STRATA_VISION_NPU_DEVICE`), in the environment that starts the server.  The server passes the vision section's
+   `max_tokens` to the reader; with `--anysize` it must not be above the export's largest budget, or the reader
+   answers one `ERR` line naming both.
 2. In the run config, point `vision.exe` at `tools/vision/strata_vision_npu.py` (Linux, Mac) or
    `tools/vision/strata-vision-npu.cmd` (Windows), and keep `vision.cpu_exe` at the normal `strata-vision`.
 
@@ -210,14 +276,26 @@ the 642 prompt tokens - and the model answered "Red on the left, blue on the rig
 again round-tripped in 1.9 s through the server's picture-hash cache.  While resident the reader is the process
 holding `/dev/accel/accel0` (`fuser /dev/accel/accel0` shows it).
 
-Not tested: Windows and the `.cmd` launcher; other NPU generations and driver versions; `strata launch --vision`
-- no CLI flag asks for this reader yet, and no default changed.
+Checked 2026-10-24 to 2026-10-27 on Windows 11 Pro 10.0.26300: an Intel Core Ultra 9 285K (Arrow Lake NPU, NPU
+3720, Intel NPU driver 32.0.100.5540) with an RTX 3090, OpenVINO 2026.4.1, run as a standard user account:
+
+- the recommended export on the NPU: 0.997881 mean against `strata-vision` on 7 pictures (4032 rows), 1.85 s a
+  picture, about 0.02 CPU cores busy;
+- neither Linux driver finding shows on this driver: the whole 27-block graph compiled (113 s) and ran (1.83 s),
+  and a split export without `--ln-scale max` stayed finite and matched (0.997897);
+- `strata-vision-npu.cmd` fails for an account with no `py` or `python` on its PATH (exit 9009, no `ERR` line),
+  and with one there it would pick that Python, not the venv with OpenVINO;
+- the any-size export and reader of the section above, with the numbers given there.
+
+Not tested: the `.cmd` launcher's fallback path in the server; other NPU generations and driver versions;
+`strata launch --vision` - no CLI flag asks for this reader yet, and no default changed.
 
 The tests run on every PC, no driver and no hardware:
 
 ```
 python -m unittest tools.test_strata_vision_npu      # the reader: protocol, SVE1 bytes, grid, errors, normalization
 python -m unittest tools.test_export_npu_encoder     # the exporter: token order, rope tables, folded weights, refusals
+python -m unittest tools.test_npu_anysize            # any size: mtmd sizing, tables, padding; with OpenVINO, the graphs
 ```
 
 They cover the protocol, the `SVE1` bytes, the grid order, the error lines, the normalization triples, the
